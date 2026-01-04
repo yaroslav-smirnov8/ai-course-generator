@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Node
+node_modules/
+dist/
+.nuxt/
+.output/
+.env
+.env.local
+.env.development
+.env.production
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.cursorrules
+
+# Logs
+logs/
+*.log
+
+# Database
+*.db
+*.sqlite
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.tsbuildinfo
+vite.config.d.ts
+
+# Portfolio docs (not needed in repo)
+portfolio/
+PORTFOLIO_*.md
+CLEANUP_*.md
+REFACTORING_*.md
+
+# Old structure
+public/
+src/components/
+src/utils/

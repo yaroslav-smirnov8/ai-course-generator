@@ -1,0 +1,159 @@
+@import './globals.css';
+@import './base.css';
+@import './components.css';
+@import '../components/admin/styles/admin.css';
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Переопределяем стили, вызывающие черный блок в Telegram WebApp */
+html, body {
+  margin: 0 !important;
+  padding: 0 !important;
+  overflow-x: hidden !important;
+  width: 100% !important;
+  height: 100% !important;
+  min-height: 100vh !important;
+}
+
+/* Стили для страницы LessonPlan */
+body:has(.lesson-plan-container) {
+  margin: 0 !important;
+  padding: 0 !important;
+  overflow-x: hidden !important;
+  background: none !important;
+}
+
+/* Глобальный стиль для LessonPlan */
+.lesson-plan-container {
+  padding-top: 0 !important;
+  margin-top: 0 !important;
+}
+
+/* Стиль для черного блока Telegram */
+.telegram-header-spacer {
+  height: 170px !important;
+  min-height: 170px !important;
+  max-height: 170px !important;
+  width: 100% !important;
+  display: block !important;
+  position: relative !important;
+  background-color: transparent !important;
+}
+
+/* Предотвращаем любые абсолютные позиции, которые могут влиять на макет */
+* {
+  box-sizing: border-box !important;
+}
+
+/* Оптимизация загрузки шрифтов */
+@font-face {
+  font-family: 'Main Font';
+  src: local('Main Font'), 
+       url('/fonts/main-font.woff2') format('woff2'),
+       url('/fonts/main-font.woff') format('woff');
+  font-display: swap; /* Улучшает производительность загрузки шрифтов */
+  font-weight: 400;
+  font-style: normal;
+}
+
+/* Предзагрузка шрифтов через link preload в head */
+/* Добавьте в index.html:
+<link rel="preload" href="/fonts/main-font.woff2" as="font" type="font/woff2" crossorigin>
+*/
+
+#app {
+    width: 100%;
+    margin: 0 auto;
+    font-weight: normal;
+}
+
+body {
+    min-height: 100vh;
+    line-height: 1.5;
+    font-family: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu,
+    Cantarell, 'Fira Sans', 'Droid Sans', 'Helvetica Neue', sans-serif;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+/* ПРИНУДИТЕЛЬНОЕ ИСПРАВЛЕНИЕ ПРОБЛЕМЫ С ВИДИМОСТЬЮ */
+body {
+    position: relative !important;
+    overflow-y: auto !important;
+}
+
+#app {
+    display: block !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+    position: relative !important;
+    overflow-y: auto !important;
+    min-height: 100vh !important;
+    width: 100% !important;
+    z-index: 1 !important;
+}
+
+.router-view {
+    display: block !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+    position: relative !important;
+    overflow-y: auto !important;
+    min-height: 80vh !important;
+    width: 100% !important;
+    z-index: 10 !important;
+}
+
+.home-view, 
+.courses-view, 
+.modes-view, 
+.profile-view {
+    display: block !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+    position: relative !important;
+    overflow-y: auto !important;
+    min-height: 80vh !important;
+    width: 100% !important;
+    z-index: 20 !important;
+}
+
+/* Ускоряем анимации переходов */
+.fade-enter-active,
+.fade-leave-active {
+    transition: opacity 0.2s ease !important;
+}
+
+.fade-enter-from,
+.fade-leave-to {
+    opacity: 0 !important;
+}
+
+/* Принудительно отображаем основной контент */
+.main-content-container {
+    display: block !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+    position: relative !important;
+    min-height: 100vh !important;
+    width: 100% !important;
+    z-index: 5 !important;
+    overflow-y: auto !important;
+}
+
+/* Фиксируем нижнюю навигацию */
+.bottom-navigation {
+    display: flex !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+    position: fixed !important;
+    bottom: 0 !important;
+    left: 0 !important;
+    right: 0 !important;
+    z-index: 50 !important;
+}
+
+/* КОНЕЦ ПРИНУДИТЕЛЬНОГО ИСПРАВЛЕНИЯ */

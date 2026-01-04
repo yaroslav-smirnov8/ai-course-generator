@@ -1,0 +1,103 @@
+/* Стили для ленивой загрузки изображений */
+
+.lazy-image {
+  opacity: 0;
+  transition: opacity 0.3s ease-in-out;
+  will-change: opacity;
+}
+
+.lazy-loading {
+  position: relative;
+  background-color: #f0f0f0;
+}
+
+.lazy-loading::before {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 30px;
+  height: 30px;
+  margin: -15px 0 0 -15px;
+  border: 3px solid rgba(0, 0, 0, 0.1);
+  border-top-color: #3498db;
+  border-radius: 50%;
+  animation: lazy-spinner 0.8s linear infinite;
+}
+
+.lazy-loaded {
+  opacity: 1;
+}
+
+.lazy-error {
+  opacity: 1;
+  position: relative;
+  background-color: #f8d7da;
+}
+
+.lazy-error::before {
+  content: '⚠️';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  font-size: 24px;
+}
+
+/* Анимация загрузки */
+@keyframes lazy-spinner {
+  0% { transform: translate(-50%, -50%) rotate(0deg); }
+  100% { transform: translate(-50%, -50%) rotate(360deg); }
+}
+
+/* Эффект размытия при загрузке */
+.lazy-blur-up {
+  filter: blur(10px);
+  transition: filter 0.3s ease-out;
+}
+
+.lazy-blur-up.lazy-loaded {
+  filter: blur(0);
+}
+
+/* Адаптация для темной темы */
+:root[data-theme="dark"] .lazy-loading {
+  background-color: #2d2d2d;
+}
+
+:root[data-theme="dark"] .lazy-loading::before {
+  border-color: rgba(255, 255, 255, 0.1);
+  border-top-color: #3498db;
+}
+
+:root[data-theme="dark"] .lazy-error {
+  background-color: #2c1215;
+}
+
+/* Стили для контейнеров с соотношением сторон */
+.lazy-container {
+  position: relative;
+  width: 100%;
+  overflow: hidden;
+}
+
+.lazy-container[data-ratio="16:9"] {
+  padding-bottom: 56.25%;
+}
+
+.lazy-container[data-ratio="4:3"] {
+  padding-bottom: 75%;
+}
+
+.lazy-container[data-ratio="1:1"] {
+  padding-bottom: 100%;
+}
+
+.lazy-container > img {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+} 

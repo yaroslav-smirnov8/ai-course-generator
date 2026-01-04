@@ -1,0 +1,65 @@
+/* src/components/admin/styles/components.css */
+@layer components {
+    /* Стили для таблиц */
+    .admin-table {
+        @apply w-full text-left;
+    }
+
+    .admin-table-header {
+        @apply bg-gray-900;
+    }
+
+    .admin-table-th {
+        @apply p-4 text-gray-400;
+    }
+
+    .admin-table-row {
+        @apply border-t border-gray-700 hover:bg-gray-700/50;
+    }
+
+    .admin-table-td {
+        @apply p-4;
+    }
+
+    /* Стили для карточек */
+    .admin-card {
+        @apply bg-gray-800 rounded-lg p-6;
+    }
+
+    .admin-card-header {
+        @apply flex justify-between items-start;
+    }
+
+    .admin-card-title {
+        @apply text-lg font-semibold text-white;
+    }
+
+    .admin-card-subtitle {
+        @apply text-gray-400 text-sm;
+    }
+
+    .admin-card-content {
+        @apply mt-4 space-y-2;
+    }
+
+    /* Бейджи */
+    .admin-badge {
+        @apply px-2 py-1 rounded-full text-xs;
+    }
+
+    .admin-badge-success {
+        @apply bg-green-500/20 text-green-300;
+    }
+
+    .admin-badge-warning {
+        @apply bg-orange-500/20 text-orange-300;
+    }
+
+    .admin-badge-error {
+        @apply bg-red-500/20 text-red-300;
+    }
+
+    .admin-badge-info {
+        @apply bg-blue-500/20 text-blue-300;
+    }
+}

@@ -1,0 +1,472 @@
+/* Глобальные стили для оптимизации */
+
+/* Предзагрузка критических изображений */
+@font-face {
+  font-family: 'Main Font';
+  font-display: swap; /* Улучшает производительность загрузки шрифтов */
+}
+
+/* Оптимизация изображений */
+img {
+  max-width: 100%;
+  height: auto;
+}
+
+/* Обязательные стили для Telegram WebApp */
+html, body {
+  margin: 0 !important;
+  padding: 0 !important;
+  overflow-x: hidden !important;
+  width: 100% !important;
+  height: 100% !important;
+  min-height: 100vh !important;
+  overflow-y: auto !important; /* Всегда разрешаем вертикальную прокрутку */
+}
+
+/* Глобальный стиль для LessonPlan */
+.lesson-plan-container {
+  padding-top: 0 !important;
+  margin-top: 0 !important;
+  overflow-y: auto !important; /* Разрешаем вертикальную прокрутку */
+  max-height: 100vh !important; /* Ограничиваем высоту экраном */
+  position: relative !important;
+  top: 0 !important;
+  left: 0 !important;
+  width: 100% !important;
+  height: auto !important; /* Авто-высота для контента */
+}
+
+/* Стиль для черного блока Telegram */
+.telegram-header-spacer {
+  height: 170px !important;
+  min-height: 170px !important;
+  max-height: 170px !important;
+  width: 100% !important;
+  display: block !important;
+  position: relative !important;
+  background-color: transparent !important;
+}
+
+/* Предотвращаем любые абсолютные позиции, которые могут влиять на макет */
+* {
+  box-sizing: border-box !important;
+}
+
+/* Фиксация глобального фона */
+.global-background {
+  background-image: url('@/assets/images/home/black_sky_pinkish_space_milky_way_background_gf9zyhoy9vn0sm4hqt4l.svg');
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+  background-attachment: fixed; /* Фиксированный фон при прокрутке */
+  padding: 0 !important; /* Убираем отступы */
+  margin: 0 !important; /* Убираем отступы */
+  min-height: 100vh; /* Минимальная высота на весь экран */
+  overflow: hidden !important; /* Предотвращаем прокрутку самого фона */
+  position: fixed !important;
+  z-index: var(--z-index-background) !important; /* Базовый z-index для фона */
+  top: 0 !important;
+  left: 0 !important;
+  right: 0 !important;
+  bottom: 0 !important;
+  width: 100vw !important;
+  height: 100vh !important;
+  pointer-events: none !important; /* Позволяет кликать через фон */
+}
+
+/* Оптимизация для мобильных устройств */
+@media (max-width: 768px) {
+  .global-background {
+    background-attachment: scroll; /* На мобильных устройствах fixed может вызывать проблемы */
+  }
+}
+
+/* Анимации с оптимизацией для GPU */
+.fade-enter-active,
+.fade-leave-active,
+.fade-enter-from,
+.fade-leave-to {
+  position: absolute !important;
+  width: 100% !important;
+  z-index: auto !important;
+  transition: opacity 0.3s ease;
+  will-change: opacity; /* Подсказка браузеру для оптимизации */
+}
+
+/* Удаляем оптимизацию для темной темы, так как она вызывает проблемы с черным экраном */
+/* :root[data-theme="dark"] .global-background {
+  filter: brightness(0.8); 
+} */
+
+/* Оптимизация для экономии трафика */
+@media (prefers-reduced-data: reduce) {
+  .global-background {
+    background-image: none;
+    background-color: #1a1a2e; /* Простой цвет вместо изображения */
+  }
+}
+
+/* Принудительно скрываем ТОЛЬКО неактивные контейнеры lesson-plan при переходе */
+.lesson-plan-container.v-leave-active,
+.lesson-plan-container.v-leave-to {
+  display: none !important;
+  opacity: 0 !important;
+  visibility: hidden !important;
+  position: absolute !important;
+  z-index: -100 !important;
+  pointer-events: none !important;
+  transition: none !important;
+}
+
+/* Активные контейнеры должны быть видимы */
+.lesson-plan-container[data-route]:not([data-route=""]) {
+  display: block !important;
+  opacity: 1 !important;
+  visibility: visible !important;
+  position: relative !important;
+  z-index: 1 !important;
+}
+
+/* Улучшаем видимость router-view при переходах */
+.router-view-container {
+  position: relative !important;
+  min-height: 100vh !important;
+  z-index: 5 !important;
+  display: block !important;
+  width: 100% !important;
+}
+
+/* Делаем routes-view компонент более заметным */
+.router-view, router-view {
+  display: block !important;
+  opacity: 1 !important;
+  visibility: visible !important;
+  z-index: 20 !important;
+  position: relative !important;
+  width: 100% !important;
+  height: auto !important;
+  min-height: 50vh !important;
+  overflow: visible !important;
+  background: transparent !important;
+}
+
+/* Фиксируем проблему с overflow */
+body.has-navigation {
+  padding-bottom: 80px;
+}
+
+/* Усиливаем специфичность селекторов для предотвращения конфликтов */
+.main-content-container, main {
+  overflow-y: auto !important;
+  -webkit-overflow-scrolling: touch !important; /* Плавная прокрутка на iOS */
+  position: relative !important;
+  z-index: 10 !important;
+  min-height: 100vh !important;
+  width: 100% !important;
+  display: block !important;
+  opacity: 1 !important;
+  visibility: visible !important;
+}
+
+/* Страницы должны быть видимы - ВАЖНО! */
+.home-view, .modes-view, .courses-view, .profile-view, .router-view-component {
+  display: block !important;
+  min-height: 90vh !important;
+  z-index: 15 !important; /* Повышенный z-index */
+  position: relative !important;
+  opacity: 1 !important;
+  visibility: visible !important;
+  transition: none !important; /* Отключаем анимации для предотвращения проблем */
+  transform: none !important; /* Предотвращаем 3D трансформации */
+  left: 0 !important; /* Фиксированное положение */
+  top: 0 !important; /* Фиксированное положение */
+  width: 100% !important;
+}
+
+/* Предотвращаем перекрытие навигацией основного контента */
+.nav-container {
+  position: fixed !important;
+  bottom: 0 !important;
+  left: 0 !important;
+  right: 0 !important;
+  width: 100% !important;
+  opacity: 1 !important;
+  visibility: visible !important;
+  z-index: var(--z-index-navbar) !important; /* ОЧЕНЬ высокий z-index */
+  display: block !important;
+  height: auto !important;
+  transform: none !important;
+  pointer-events: auto !important; /* КРИТИЧНО: разрешает события клика */
+  box-shadow: 0 -4px 6px -1px rgba(255, 202, 248, 0.2);
+}
+
+/* Включаем pointer-events для всех элементов внутри навигации */
+.nav-container *, 
+.nav-container a, 
+.nav-container button,
+.nav-container svg {
+  pointer-events: auto !important;
+}
+
+/* Глобальное правило для принудительного отображения контента в компонентах страниц */
+[data-view], [data-component] {
+  display: block !important;
+  visibility: visible !important;
+  opacity: 1 !important;
+  position: relative !important;
+}
+
+/* Фиксируем потенциальные проблемы с z-index */
+#app {
+  isolation: isolate !important; /* Создает новый контекст наложения */
+  position: relative !important;
+  z-index: 1 !important;
+  overflow-x: hidden !important;
+  width: 100% !important;
+  height: auto !important;
+  min-height: 100vh !important;
+}
+
+/* Предотвращаем скрытие всех элементов при анимации */
+* {
+  transform-style: flat !important; /* Предотвращает 3D преобразования */
+  backface-visibility: visible !important; /* Предотвращает скрытие обратной стороны элементов */
+}
+
+/* Специальное правило для Vue Toastification */
+.Vue-Toastification__container {
+  z-index: 10000 !important; /* Выше всех остальных элементов */
+}
+
+/* Фиксация стилей для тостификации и других сторонних компонентов */
+.Vue-Toastification__toast {
+  position: relative !important;
+  z-index: 10001 !important;
+  pointer-events: auto !important;
+}
+
+/* Фиксируем возможные конфликты со стилями Vue Toastification */
+.Vue-Toastification__progress-bar {
+  position: absolute !important;
+  bottom: 0 !important;
+  left: 0 !important;
+  z-index: 10002 !important;
+}
+
+/* Увеличиваем видимость всех типов страниц */
+div[class$="-view"], 
+.home-view, 
+.modes-view, 
+.courses-view, 
+.profile-view, 
+.router-view-component,
+div[data-view] {
+  min-height: 100vh !important;
+  display: block !important;
+  opacity: 1 !important;
+  visibility: visible !important;
+  z-index: 15 !important;
+  position: relative !important;
+  top: 0 !important;
+  left: 0 !important;
+  right: 0 !important;
+  bottom: 0 !important;
+  width: 100% !important;
+  height: auto !important;
+  overflow: visible !important;
+  transform: none !important;
+  pointer-events: auto !important;
+}
+
+/* Специальное правило для видимости Modes компонента */
+.modes-view {
+  z-index: 20 !important;
+  display: block !important;
+  position: relative !important;
+  opacity: 1 !important;
+  visibility: visible !important;
+}
+
+/* РАДИКАЛЬНОЕ РЕШЕНИЕ - принудительная видимость всего */
+body, html, #app, main, .router-view-container, router-view, .main-content-container {
+  opacity: 1 !important;
+  visibility: visible !important;
+  display: block !important;
+  position: relative !important;
+  z-index: auto !important;
+  overflow: visible !important;
+  min-height: 100vh !important;
+  transform: none !important;
+  transform-style: flat !important;
+  backface-visibility: visible !important;
+  perspective: none !important;
+  clip-path: none !important;
+  -webkit-clip-path: none !important;
+  mask: none !important;
+  -webkit-mask: none !important;
+  filter: none !important;
+  background-clip: border-box !important;
+}
+
+/* Принудительно делаем компоненты видимыми */
+.component-container,
+[data-component], 
+[data-view],
+section, article, div.content, 
+div[class*="container"],
+div[class*="view"],
+div[class*="page"],
+.content-wrapper {
+  visibility: visible !important;
+  opacity: 1 !important;
+  display: block !important;
+  position: relative !important;
+  width: 100% !important;
+  z-index: 5 !important;
+  pointer-events: auto !important;
+}
+
+/* Фиксируем переходы анимации */
+.fade-enter-active,
+.fade-leave-active,
+.fade-enter-from,
+.fade-leave-to {
+  position: absolute !important;
+  width: 100% !important;
+  z-index: auto !important;
+}
+
+/* САМОЕ ВАЖНОЕ - ФИКСАЦИЯ ROUTER-VIEW */
+router-view,
+.router-view {
+  display: block !important;
+  opacity: 1 !important;
+  visibility: visible !important;
+  z-index: 20 !important;
+  position: relative !important;
+  width: 100% !important;
+  height: auto !important;
+  min-height: 50vh !important;
+  overflow: visible !important;
+  background: transparent !important;
+}
+
+/* Исправление для lesson-plan при активации */
+.lesson-plan-container[data-route="/lesson-plan"],
+.lesson-plan-container[data-route="/lesson-plan-detailed"] {
+  overflow-y: auto !important;
+  height: auto !important;
+  min-height: 100vh !important;
+  position: relative !important;
+  display: block !important;
+  opacity: 1 !important;
+  visibility: visible !important;
+  /* Важно: убеждаемся, что container не перекрывает навигацию */
+  padding-bottom: 70px !important; /* Отступ для навпанели */
+  z-index: var(--z-index-content) !important;  /* Используем переменную */
+}
+
+/* Предотвращаем наложение любых контейнеров на навигацию */
+.lesson-plan-container::after {
+  content: '';
+  display: block;
+  height: 70px; /* Высота навигационной панели + отступ */
+  width: 100%;
+}
+
+/* Z-index переменные для управления слоями приложения - заменяем на более простые */
+:root {
+  /* Базовые слои */
+  --z-index-background: 0;
+  --z-index-content: 1;
+  --z-index-component: 2;
+  
+  /* Основные элементы */
+  --z-index-router-view: 1;
+  --z-index-main-content: 2;
+  
+  /* Специальные элементы */
+  --z-index-navbar: 10; /* Навигация всегда должна быть над обычным контентом */
+  --z-index-toast: 20;  /* Уведомления выше навигации */
+  --z-index-modal: 30;  /* Модальные окна перекрывают всё */
+  --z-index-loader: 40; /* Загрузчик должен быть на самом верху */
+}
+
+/* Принудительное отображение всех view-компонентов */
+.home-view, .modes-view, .courses-view, .profile-view, [class$="-view"] {
+  /* Удалены принудительные стили */
+}
+
+/* Делаем все router-view видимыми */
+router-view, .router-view, .router-view-container {
+  /* Удалены принудительные стили */
+}
+
+/* Отключаем временно все transition-эффекты для отладки */
+.fade-enter-active,
+.fade-leave-active,
+.fade-enter-from,
+.fade-leave-to {
+  /* Удалены принудительные стили для отключения переходов */
+}
+
+/* Принудительная установка для всех MutationObserver целей */
+.main-content-container {
+  /* Удалены принудительные стили */
+}
+
+/* Улучшаем отображение активного компонента */
+.component-container.active,
+[data-route].active,
+[data-view].active,
+[data-component].active {
+  /* Удалены принудительные стили */
+}
+
+/* Фиксация глобального фона - упрощаем */
+.global-background {
+  z-index: var(--z-index-background);
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+  pointer-events: none; /* Позволяет кликать через фон */
+}
+
+/* Фиксируем навигацию - упрощаем */
+.nav-container {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  z-index: var(--z-index-navbar);
+  pointer-events: auto; /* Разрешаем клики по навигации */
+  box-shadow: 0 -4px 6px -1px rgba(255, 202, 248, 0.2);
+}
+
+/* Удаляем ненужные !important */
+.nav-container *, 
+.nav-container button,
+.nav-container a {
+  pointer-events: auto; /* Разрешаем клики по элементам внутри навигации */
+}
+
+/* Упрощаем решение для lesson-plan при активации */
+.lesson-plan-container[data-route="/lesson-plan"],
+.lesson-plan-container[data-route="/lesson-plan-detailed"] {
+  overflow-y: auto;
+  height: auto;
+  min-height: 100vh;
+  position: relative;
+  display: block;
+  opacity: 1;
+  visibility: visible;
+  padding-bottom: 70px; /* Отступ для навпанели */
+  z-index: var(--z-index-content);
+}
+
+/* Удаляем все лишние правила для отображения компонентов, которые добавили ранее */ 

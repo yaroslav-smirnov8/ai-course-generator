@@ -1,0 +1,7758 @@
+# app/services/content/generator.py
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from typing import Optional, Dict, Any, List, Union
+import logging
+from datetime import datetime, timedelta, timezone
+import asyncio
+import time
+import re
+import hashlib
+import json
+import os
+import demjson3
+import traceback
+
+from ...models import Generation, User, Course, Lesson, Image, VideoTranscript
+from ...core.exceptions import ValidationError
+from ...core.constants import ContentType
+from ...services.optimization.query_optimizer import QueryOptimizer
+from ...services.optimization.batch_processor import BatchProcessor
+from ...core.cache import CacheService
+from ...core.memory import memory_optimized
+from ...utils.g4f_handler import G4FHandler, G4F_AVAILABLE
+from ...utils.mistral_api import MistralHandler, MISTRAL_AVAILABLE
+try:
+    from ...utils.gemini_api import GeminiHandler, GEMINI_AVAILABLE
+except ImportError:
+    GEMINI_AVAILABLE = False
+try:
+    from ...utils.llm7_api import LLM7Handler, LLM7_AVAILABLE
+except ImportError:
+    LLM7_AVAILABLE = False
+from youtube_transcript_api import YouTubeTranscriptApi
+from ...schemas.content import TextLevelAnalysis, TitlesAnalysis, QuestionsAnalysis
+from fastapi import Request
+
+logger = logging.getLogger(__name__)
+
+
+class ContentGenerator:
+    def __init__(self, session: AsyncSession):
+        self.session = session
+        self.query_optimizer = QueryOptimizer(session)
+        self.cache_service = CacheService()
+        self.batch_processor = BatchProcessor(session)
+        # Initialize queue to None - we'll create it when needed
+        self._generation_queue = None
+
+        # Получаем API ключи из переменных окружения
+        mistral_api_key = os.environ.get("MISTRAL_API_KEY")
+        gemini_api_key = os.environ.get("GEMINI_API_KEY")
+        groq_api_key = os.environ.get("GROQ_API_KEY")
+        llm7_api_key = os.environ.get("LLM7_API_KEY")
+        together_api_key = os.environ.get("TOGETHER_API_KEY")
+        cerebras_api_key = os.environ.get("CEREBRAS_API_KEY")
+        chutes_api_key = os.environ.get("CHUTES_API_KEY")
+
+        # Инициализируем обработчики API для разных провайдеров
+        self.mistral_handler = None
+        self.gemini_handler = None
+        self.groq_handler = None
+        self.llm7_handler = None
+        self.together_handler = None
+        self.cerebras_handler = None
+        self.chutes_handler = None
+        self.g4f_handler = None
+
+        # Флаги доступности провайдеров
+        self._mistral_available = False
+        self._gemini_available = False
+        self._groq_available = False
+        self._llm7_available = False
+        self._together_available = False
+        self._cerebras_available = False
+        self._chutes_available = False
+        self._g4f_available = False
+
+        # Инициализируем Gemini API если доступен ключ
+        if gemini_api_key:
+            try:
+                from ...utils.gemini_api import GeminiHandler, GEMINI_AVAILABLE
+                if GEMINI_AVAILABLE:
+                    self.gemini_handler = GeminiHandler(api_key=gemini_api_key)
+                    self._gemini_available = self.gemini_handler.is_available()
+                    logger.info(f"GeminiHandler инициализирован и доступен: {self._gemini_available}")
+                else:
+                    logger.warning("Библиотека Google Generative AI не установлена")
+            except Exception as e:
+                logger.error(f"Ошибка при инициализации GeminiHandler: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+        else:
+            logger.warning("API ключ Google Gemini не найден в переменных окружения")
+
+        # Инициализируем Mistral API если доступен ключ
+        if mistral_api_key:
+            try:
+                from ...utils.mistral_api import MistralHandler, MISTRAL_AVAILABLE
+                if MISTRAL_AVAILABLE:
+                    self.mistral_handler = MistralHandler(api_key=mistral_api_key)
+                    self._mistral_available = self.mistral_handler.is_available()
+                    logger.info(f"MistralHandler инициализирован и доступен: {self._mistral_available}")
+                else:
+                    logger.warning("Библиотека Mistral не установлена")
+            except Exception as e:
+                logger.error(f"Ошибка при инициализации MistralHandler: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+        else:
+            logger.warning("API ключ Mistral не найден в переменных окружения")
+
+        # Инициализируем OpenRouter API если доступен ключ
+        openrouter_api_key = os.environ.get("OPENROUTER_API_KEY")
+        self.openrouter_handler = None
+        self._openrouter_available = False
+
+        if openrouter_api_key:
+            try:
+                from ...utils.openrouter_api import OpenRouterHandler, OPENROUTER_AVAILABLE
+                if OPENROUTER_AVAILABLE:
+                    self.openrouter_handler = OpenRouterHandler(api_key=openrouter_api_key)
+                    self._openrouter_available = self.openrouter_handler.is_available()
+                    logger.info(f"OpenRouterHandler инициализирован и доступен: {self._openrouter_available}")
+                else:
+                    logger.warning("Модуль OpenRouter не доступен")
+            except Exception as e:
+                logger.error(f"Ошибка при инициализации OpenRouterHandler: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+        else:
+            logger.warning("API ключ OpenRouter не найден в переменных окружения")
+
+        # Инициализируем Groq API если доступен ключ
+        self.groq_handler = None
+        self._groq_available = False
+
+        if groq_api_key:
+            try:
+                from ...utils.groq_api import GroqHandler, GROQ_AVAILABLE
+                if GROQ_AVAILABLE:
+                    self.groq_handler = GroqHandler(api_key=groq_api_key)
+                    self._groq_available = self.groq_handler.is_available()
+                    logger.info(f"GroqHandler инициализирован и доступен: {self._groq_available}")
+                else:
+                    logger.warning("Модуль Groq не доступен")
+            except Exception as e:
+                logger.error(f"Ошибка при инициализации GroqHandler: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+        else:
+            logger.warning("API ключ Groq не найден в переменных окружения")
+
+        # Инициализируем LLM7 API если доступен ключ
+        if llm7_api_key:
+            try:
+                from ...utils.llm7_api import LLM7Handler, LLM7_AVAILABLE
+                if LLM7_AVAILABLE:
+                    self.llm7_handler = LLM7Handler(api_key=llm7_api_key)
+                    self._llm7_available = self.llm7_handler.is_available()
+                    logger.info(f"LLM7Handler инициализирован и доступен: {self._llm7_available}")
+                else:
+                    logger.warning("Модуль LLM7 не доступен")
+            except Exception as e:
+                logger.error(f"Ошибка при инициализации LLM7Handler: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+        else:
+            logger.warning("API ключ LLM7 не найден в переменных окружения")
+
+        # Инициализируем Together AI (используем встроенные ключи)
+        try:
+            from ...utils.together_api import TogetherHandler
+            self.together_handler = TogetherHandler()
+            self._together_available = True
+            logger.info("TogetherHandler инициализирован с встроенными ключами")
+        except Exception as e:
+            logger.error(f"Ошибка при инициализации TogetherHandler: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+
+        # Инициализируем Cerebras (используем встроенные ключи)
+        try:
+            from ...utils.cerebras_api import CerebrasHandler
+            self.cerebras_handler = CerebrasHandler()
+            self._cerebras_available = True
+            logger.info("CerebrasHandler инициализирован с встроенными ключами")
+        except Exception as e:
+            logger.error(f"Ошибка при инициализации CerebrasHandler: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+
+        # Инициализируем Chutes AI (используем встроенные ключи)
+        try:
+            from ...utils.chutes_api import ChutesHandler
+            self.chutes_handler = ChutesHandler()
+            self._chutes_available = True
+            logger.info("ChutesHandler инициализирован с встроенными ключами")
+        except Exception as e:
+            logger.error(f"Ошибка при инициализации ChutesHandler: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+
+        # Инициализируем G4F как запасной вариант
+        try:
+            from ...utils.g4f_handler import G4FHandler, G4F_AVAILABLE
+            if G4F_AVAILABLE:
+                self.g4f_handler = G4FHandler(
+                    api_key=mistral_api_key,
+                    openrouter_api_key=openrouter_api_key,
+                    llm7_api_key=llm7_api_key,
+                    gemini_handler=self.gemini_handler if self._gemini_available else None,
+                    groq_handler=self.groq_handler if self._groq_available else None,
+                    together_handler=self.together_handler if self._together_available else None,
+                    cerebras_handler=self.cerebras_handler if self._cerebras_available else None,
+                    chutes_handler=self.chutes_handler if self._chutes_available else None
+                )
+                self._g4f_available = True
+                logger.info("G4FHandler инициализирован")
+            else:
+                logger.warning("G4F не установлен, этот провайдер будет недоступен")
+        except Exception as e:
+            logger.error(f"Ошибка при инициализации G4FHandler: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+
+        # Логируем информацию о доступных провайдерах
+        logger.info(f"ContentGenerator инициализирован (доступные провайдеры: Gemini: {self._gemini_available}, OpenRouter: {self._openrouter_available}, Groq: {self._groq_available}, LLM7: {self._llm7_available}, Together: {self._together_available}, Cerebras: {self._cerebras_available}, Chutes: {self._chutes_available}, Mistral: {self._mistral_available}, G4F: {self._g4f_available})")
+
+    async def ensure_g4f_handler(self) -> bool:
+        """Проверяем и обеспечиваем доступность провайдеров генерации"""
+        # Если ни один провайдер не доступен, пробуем переинициализировать
+        if not self._gemini_available and not self._openrouter_available and not self._groq_available and not self._llm7_available and not self._together_available and not self._cerebras_available and not self._chutes_available and not self._mistral_available and not self._g4f_available:
+            logger.info("Ни один провайдер генерации не доступен, пробуем переинициализировать")
+            return await self.refresh_g4f_handler()
+
+        # Если хотя бы один провайдер доступен, возвращаем True
+        return self._gemini_available or self._openrouter_available or self._groq_available or self._llm7_available or self._together_available or self._cerebras_available or self._chutes_available or self._mistral_available or self._g4f_available
+
+    async def get_generation_queue(self):
+        """Lazy initialization of generation queue"""
+        if self._generation_queue is None:
+            # Import here to avoid circular import
+            from ...services.queue.generation_queue import AsyncGenerationQueue
+            self._generation_queue = AsyncGenerationQueue(self.session)
+            await self._generation_queue.initialize()
+        return self._generation_queue
+
+    async def generate_content(
+        self,
+        user_id: int,
+        prompt: str,
+        content_type: ContentType,
+        use_cache: bool = True,
+        force_queue: bool = False,
+        extra_params: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """
+        Генерирует контент на основе промпта
+
+        Args:
+            user_id: ID пользователя
+            prompt: Текст промпта
+            content_type: Тип контента
+            use_cache: Использовать ли кэширование
+            force_queue: Принудительно использовать очередь вместо прямой генерации
+            extra_params: Дополнительные параметры для генерации
+
+        Returns:
+            str: Сгенерированный текст
+        """
+        try:
+            # Логируем детали запроса
+            logger.info(f"Генерация контента типа: {content_type.value if hasattr(content_type, 'value') else content_type}")
+            logger.info(f"Параметры: user_id={user_id}, use_cache={use_cache}, force_queue={force_queue}")
+
+            # Сохраняем параметры для использования в других методах
+            self._current_extra_params = extra_params or {}
+            # Добавляем параметр use_cache в extra_params для передачи в другие методы
+            self._current_extra_params['use_cache'] = use_cache
+
+            if extra_params:
+                logger.info(f"Дополнительные параметры: {json.dumps(extra_params, ensure_ascii=False, default=str)[:200]}...")
+
+            # Создаем кэш-ключ
+            cache_key = self._create_cache_key(prompt, content_type, extra_params)
+
+            # Проверяем кэш, если use_cache=True
+            if use_cache:
+                cached_content = await self.cache_service.get_cached_data(cache_key)
+                if cached_content:
+                    logger.info(f"Найден кэшированный контент, длина: {len(cached_content) if isinstance(cached_content, str) else 'не строка'}")
+                    return cached_content
+
+            # Валидируем длину промпта
+            self._validate_prompt(prompt, content_type)
+
+            # Проверяем и инициализируем G4FHandler
+            if not force_queue and await self.ensure_g4f_handler():
+                # Пытаемся сгенерировать с использованием G4FHandler
+                try:
+                    logger.info("Генерация контента через G4FHandler")
+                    content = await self._generate_with_g4f(prompt, content_type)
+                    if content:
+                        # Кэшируем результат, если use_cache=True
+                        if use_cache:
+                            await self.cache_service.cache_data(cache_key, content, ttl=3600)
+
+                        # Для структурированных данных, проверяем формат
+                        if content_type == ContentType.STRUCTURED_DATA:
+                            logger.info(f"Проверка формата структурированных данных, длина контента: {len(content)}")
+                            try:
+                                if isinstance(content, str):
+                                    # Для строковых данных, попытка найти валидный JSON
+                                    content = content.strip()
+                                    start_idx = content.find('{')
+                                    end_idx = content.rfind('}') + 1
+
+                                    if start_idx >= 0 and end_idx > start_idx:
+                                        json_str = content[start_idx:end_idx]
+                                        logger.info(f"Извлечен JSON из контента, длина: {len(json_str)}")
+                                        # Проверка валидности JSON
+                                        try:
+                                            json.loads(json_str)
+                                            return content
+                                        except json.JSONDecodeError as je:
+                                            logger.error(f"Ошибка декодирования JSON: {str(je)}")
+                                            logger.error(f"Фрагмент JSON: {json_str[:200]}...")
+                                            # Продолжаем выполнение, попробуем резервный метод
+                                    else:
+                                        logger.error("Не удалось найти валидный JSON в сгенерированном контенте")
+                                else:
+                                    # Если контент уже не строка, возвращаем как есть
+                                    return content
+                            except Exception as e:
+                                logger.error(f"Ошибка при проверке формата структурированных данных: {str(e)}")
+                                # Продолжаем выполнение, попробуем резервный метод
+                        else:
+                            # Для не структурированных данных возвращаем как есть
+                            return content
+                except Exception as g4f_error:
+                    # Логируем ошибку G4FHandler
+                    logger.error(f"Ошибка генерации через G4FHandler: {str(g4f_error)}")
+                    logger.info("Переключение на резервный метод генерации через очередь")
+
+            # Резервный метод: генерация через очередь
+            logger.info("Генерация контента через очередь (резервный метод)")
+            content = await self._generate_with_queue(user_id, prompt, content_type)
+
+            if content:
+                # Кэшируем результат, если use_cache=True
+                if use_cache:
+                    await self.cache_service.cache_data(cache_key, content, ttl=3600)
+                return content
+            else:
+                logger.error("Оба метода генерации (G4FHandler и очередь) не смогли сгенерировать контент")
+                return "Не удалось сгенерировать контент. Пожалуйста, попробуйте позже или обратитесь в поддержку."
+
+        except Exception as e:
+            logger.error(f"Критическая ошибка при генерации контента: {str(e)}")
+            import traceback
+            logger.error(f"Трассировка: {traceback.format_exc()}")
+            return "Произошла ошибка при генерации контента. Пожалуйста, попробуйте позже."
+
+    async def _save_generation(self, batch: List[Dict[str, Any]]) -> None:
+        """Batch save generations"""
+        try:
+            logger.info(f"=== SAVING GENERATIONS ===")
+            logger.info(f"Batch size: {len(batch)}")
+
+            if len(batch) > 0:
+                logger.info(f"First item user_id: {batch[0].get('user_id')}")
+                logger.info(f"First item type: {batch[0].get('type')}")
+                logger.info(f"First item prompt: {batch[0].get('prompt')[:100]}...")
+
+            generations = [
+                Generation(
+                    user_id=item["user_id"],
+                    type=item["type"].value if hasattr(item["type"], "value") else item["type"],
+                    content=item["content"],
+                    prompt=item["prompt"],
+                    created_at=datetime.now(timezone.utc)  # Используем timezone-aware datetime
+                )
+                for item in batch
+            ]
+
+            logger.info(f"Created {len(generations)} Generation objects")
+
+            self.session.add_all(generations)
+            await self.session.flush()
+
+            logger.info(f"Successfully saved {len(generations)} generations to database")
+
+            # Проверяем, что генерации действительно сохранились
+            try:
+                from sqlalchemy import select, func
+                from ...models import Generation
+
+                # Получаем общее количество генераций в базе
+                count_query = select(func.count()).select_from(Generation.__table__)
+                total_count = await self.session.scalar(count_query)
+
+                logger.info(f"Total generations in database: {total_count}")
+            except Exception as count_error:
+                logger.error(f"Error checking total generations count: {str(count_error)}")
+
+        except Exception as e:
+            logger.error(f"Error saving generations: {str(e)}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            raise
+
+    async def _get_user_priority(self, user_id: int) -> int:
+        """Get user priority for queue"""
+        query = await self.query_optimizer.optimize_query(
+            select(User).where(User.id == user_id)
+        )
+        result = await self.session.execute(query)
+        user = result.scalar_one_or_none()
+
+        if not user:
+            return 0
+
+        # Priority based on tariff and points
+        priority = 0
+        if user.tariff:
+            priority += {
+                'tariff_2': 1,
+                'tariff_4': 2,
+                'tariff_6': 3
+            }.get(user.tariff, 0)
+
+        priority += min(user.points // 1000, 5)  # Up to 5 additional points for points
+        return priority
+
+    def _validate_prompt(self, prompt: str, content_type: Union[str, ContentType]) -> None:
+        """Validate prompt length based on content type"""
+        # Define max lengths for different content types
+        max_lengths = {
+            ContentType.LESSON_PLAN: 15000,  # Увеличиваем лимит для планов уроков до 15000 символов
+            ContentType.EXERCISE: 15000,  # Увеличиваем лимит для упражнений до 15000 символов
+            ContentType.GAME: 15000,  # Увеличиваем лимит для игр до 15000 символов
+            ContentType.TRANSCRIPT: 500,
+            ContentType.TEXT_ANALYSIS: 15000,  # Увеличиваем лимит для анализа текста до 15000 символов
+            ContentType.STRUCTURED_DATA: 30000,  # Увеличиваем лимит для структурированных данных до 30000 символов
+            ContentType.COURSE: 30000,  # Увеличиваем лимит для генерации курса до 30000 символов
+            'lesson_plan': 15000,  # Увеличиваем лимит для планов уроков (строковый вариант) до 15000 символов
+            'exercise': 15000,  # Увеличиваем лимит для упражнений (строковый вариант) до 15000 символов
+            'game': 15000,  # Увеличиваем лимит для игр (строковый вариант) до 15000 символов
+            'transcript': 500,
+            'text_analysis': 15000,  # Увеличиваем лимит для анализа текста (строковый вариант) до 15000 символов
+            'structured_data': 30000,  # Увеличиваем лимит для структурированных данных (строковый вариант) до 30000 символов
+            'course': 30000,  # Увеличиваем лимит для генерации курса (строковый вариант) до 30000 символов
+            'image': 200
+        }
+
+        # Get max_length based on content_type (can be string or enum)
+        max_length = max_lengths.get(content_type, 500)
+
+        if len(prompt) > max_length:
+            ct_value = content_type.value if hasattr(content_type, 'value') else content_type
+            raise ValidationError(f"Prompt too long for {ct_value}")
+
+    @memory_optimized()
+    async def generate_lesson_plan(
+            self,
+            user_id: int,
+            course_id: Optional[int] = None,
+            lesson_data: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """Generate lesson plan with optimization"""
+        try:
+            # Prepare context for generation
+            context = await self._prepare_lesson_context(course_id, lesson_data)
+
+            # Create prompt
+            prompt = self._create_lesson_plan_prompt(context)
+
+            # Generate content through queue
+            content = await self.generate_content(
+                content_type=ContentType.LESSON_PLAN,
+                prompt=prompt,
+                user_id=user_id,
+                extra_params=context
+            )
+
+            # Structure result
+            lesson_plan = self._structure_lesson_plan(content)
+
+            # If there's a course, link it
+            if course_id:
+                await self._link_lesson_to_course(
+                    course_id,
+                    lesson_plan
+                )
+
+            return lesson_plan
+
+        except Exception as e:
+            logger.error(f"Error generating lesson plan: {str(e)}")
+            raise
+
+    async def _prepare_lesson_context(self, course_id: Optional[int], lesson_data: Optional[Dict[
+        str, Any]]) -> Dict[
+        str, Any]:
+        """Prepare context for lesson generation"""
+        context = lesson_data or {}
+
+        if course_id:
+            # Get course information to provide context
+            query = select(Course).where(Course.id == course_id)
+            result = await self.session.execute(query)
+            course = result.scalar_one_or_none()
+
+            if course:
+                context.update({
+                    "course_title": course.title,
+                    "course_description": course.description,
+                    "course_level": course.level,
+                    "course_language": course.language
+                })
+
+                # Get previous lessons in the course
+                lessons_query = select(Lesson).where(Lesson.course_id == course_id).order_by(Lesson.id.desc()).limit(1)
+                result = await self.session.execute(lessons_query)
+                previous_lesson = result.scalar_one_or_none()
+
+                if previous_lesson:
+                    context["previous_lesson"] = previous_lesson.title
+                    context["previous_content"] = previous_lesson.content
+
+        return context
+
+    def _create_lesson_plan_prompt(self, context: Dict[str, Any]) -> str:
+        """Create prompt for lesson plan generation with methodology-specific criteria"""
+
+        # Используем улучшенную функцию из content.py
+        from ..api.v1.content import format_prompt_lesson_plan_form
+
+        # Преобразуем context в формат, ожидаемый format_prompt_lesson_plan_form
+        form_data = {
+            'language': context.get('language', 'English'),
+            'level': context.get('level', 'Intermediate'),
+            'topic': context.get('topic', 'General communication'),
+            'previous_lesson': context.get('previous_lesson', ''),
+            'age': context.get('age', 'adults'),
+            'methodology': context.get('methodology', []),
+            'individual_group': context.get('individual_group', 'group'),
+            'online_offline': context.get('online_offline', 'offline'),
+            'duration': context.get('duration', 60),
+            'grammar': context.get('grammar', ''),
+            'vocabulary': context.get('vocabulary', ''),
+            'exam': context.get('exam', '')
+        }
+
+        # Используем улучшенную функцию генерации промпта
+        return format_prompt_lesson_plan_form(form_data)
+
+    def _structure_lesson_plan(self, content: str) -> Dict[str, Any]:
+        """Structure the raw generated content into a lesson plan format"""
+        # Simple parser for the content
+        sections = {
+            "title": "",
+            "objectives": [],
+            "materials": [],
+            "warm_up": "",
+            "main_activities": [],
+            "practice": [],
+            "assessment": "",
+            "homework": ["Домашнее задание 1", "Домашнее задание 2"],
+            "notes": ""
+        }
+
+        # Very basic parsing - in a real app, you'd want more robust parsing
+        current_section = None
+        lines = content.split('\n')
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+
+            # Try to identify sections
+            lower_line = line.lower()
+            if "objectives" in lower_line or "goals" in lower_line:
+                current_section = "objectives"
+                continue
+            elif "materials" in lower_line or "resources" in lower_line:
+                current_section = "materials"
+                continue
+            elif "warm" in lower_line and ("up" in lower_line or "activity" in lower_line):
+                current_section = "warm_up"
+                continue
+            elif "main" in lower_line and "activit" in lower_line:
+                current_section = "main_activities"
+                continue
+            elif "practice" in lower_line:
+                current_section = "practice"
+                continue
+            elif "assessment" in lower_line or "evaluation" in lower_line:
+                current_section = "assessment"
+                continue
+            elif "homework" in lower_line or "assignment" in lower_line:
+                current_section = "homework"
+                continue
+            elif "notes" in lower_line or "additional" in lower_line:
+                current_section = "notes"
+                continue
+            elif current_section is None and not sections["title"]:
+                sections["title"] = line
+                continue
+
+            # Process content based on current section
+            if current_section == "objectives" and line.startswith("- "):
+                sections["objectives"].append(line[2:])
+            elif current_section == "materials" and line.startswith("- "):
+                sections["materials"].append(line[2:])
+            elif current_section == "warm_up":
+                sections["warm_up"] += line + "\n"
+            elif current_section == "main_activities" and line.startswith("- "):
+                sections["main_activities"].append(line[2:])
+            elif current_section == "practice" and line.startswith("- "):
+                sections["practice"].append(line[2:])
+            elif current_section == "assessment":
+                sections["assessment"] += line + "\n"
+            elif current_section == "homework":
+                sections["homework"] += line + "\n"
+            elif current_section == "notes":
+                sections["notes"] += line + "\n"
+            elif current_section:  # Catch-all for non-bullet points in list sections
+                if current_section in ["warm_up", "assessment", "homework", "notes"]:
+                    sections[current_section] += line + "\n"
+
+        return sections
+
+    async def _link_lesson_to_course(self, course_id: int, lesson_plan: Dict[str, Any]) -> None:
+        """Link lesson to course"""
+        lesson = Lesson(
+            course_id=course_id,
+            title=lesson_plan.get('title', ''),
+            content=lesson_plan,
+            created_at=datetime.utcnow()
+        )
+        self.session.add(lesson)
+        await self.session.flush()
+
+    @memory_optimized()
+    async def generate_exercises(
+            self,
+            user_id: int,
+            params: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        """Generate exercises with optimization"""
+        try:
+            # Check parameters
+            self._validate_exercise_params(params)
+
+            # Create prompt
+            prompt = self._create_exercises_prompt(params)
+
+            # Generate content through queue
+            content = await self.generate_content(
+                content_type=ContentType.EXERCISE,
+                prompt=prompt,
+                user_id=user_id,
+                extra_params=params
+            )
+
+            # Structure exercises
+            raw_exercises = self._structure_exercises(content)
+
+            # Подготовка данных для сохранения - добавляем user_id и дополнительные поля
+            exercises_to_save = []
+            for ex in raw_exercises:
+                exercise_data = {
+                    "user_id": user_id,
+                    "type": ContentType.EXERCISE.value,
+                    "content": ex,  # Сохраняем всю структуру упражнения
+                    "prompt": prompt,  # Сохраняем промпт, который использовался для генерации
+                    "difficulty": params.get("difficulty", "medium")
+                }
+                exercises_to_save.append(exercise_data)
+
+            # Batch save exercises если список не пустой
+            if exercises_to_save:
+                await self.batch_processor.process_in_batches(
+                    exercises_to_save,
+                    self._save_exercises
+                )
+
+            return raw_exercises
+
+        except Exception as e:
+            logger.error(f"Error generating exercises: {str(e)}")
+            raise
+
+    async def _save_exercises(self, batch: List[Dict[str, Any]]) -> None:
+        """Batch save exercises"""
+        try:
+            # Используем существующую модель Generation для сохранения упражнений
+            generations = [
+                Generation(
+                    user_id=item.get("user_id"),
+                    type=item.get("type"),
+                    content=str(item.get("content")),  # Преобразуем словарь в строку
+                    prompt=str(item.get("prompt", "")),  # Устанавливаем пустую строку, если prompt нет
+                    created_at=datetime.utcnow()
+                )
+                for item in batch if item.get("content")
+            ]
+
+            if generations:
+                self.session.add_all(generations)
+                await self.session.flush()
+
+        except Exception as e:
+            logger.error(f"Ошибка при сохранении упражнений: {str(e)}")
+            raise
+
+    def _validate_exercise_params(self, params: Dict[str, Any]) -> None:
+        """Validate parameters for exercise generation"""
+        required_params = ['language', 'topic', 'difficulty', 'quantity']
+        for param in required_params:
+            if param not in params:
+                raise ValidationError(f"Missing required parameter: {param}")
+
+        if not 1 <= params.get('quantity', 0) <= 10:
+            raise ValidationError("Quantity must be between 1 and 10")
+
+    def _create_exercises_prompt(self, params: Dict[str, Any]) -> str:
+        """Create prompt for exercise generation with detailed CEFR level instructions"""
+
+        # Получаем метаданные или инициализируем пустой словарь
+        meta = params.get('meta', {})
+
+        # Получаем уровень владения языком и создаем детальные инструкции
+        proficiency = meta.get('proficiency', 'intermediate')
+        level_instruction = self._get_cefr_level_instruction(proficiency)
+
+        # Формируем инструкции для индивидуальных/групповых занятий
+        format_instruction = ""
+        if params.get('individual_group') == 'individual':
+            format_instruction = """
+!!! IMPORTANT !!!
+This is an INDIVIDUAL lesson (one-on-one teaching). The exercises should:
+- Be designed for one-on-one interaction between teacher and student
+- NOT include any pair or group activities
+- Focus on personalized feedback and individual practice
+- Avoid phrases like "work with a partner" or "discuss in groups"
+            """
+        elif params.get('individual_group') == 'group':
+            format_instruction = """
+The exercises should be designed for GROUP teaching:
+- Include activities where students can work together
+- Incorporate peer interaction and collaborative tasks
+- Utilize group dynamics for language practice
+            """
+
+        # Формируем инструкции для онлайн/оффлайн занятий
+        online_instruction = ""
+        if params.get('online_offline') == 'online':
+            online_instruction = """
+The exercises should be adapted for ONLINE teaching:
+- Utilize digital tools and platforms
+- Be suitable for screen sharing and virtual interaction
+- Consider the limitations of online communication
+            """
+        elif params.get('online_offline') == 'offline':
+            online_instruction = """
+The exercises should be adapted for OFFLINE teaching:
+- Utilize physical materials and classroom resources
+- Take advantage of face-to-face interaction
+- Include physical movement and tactile elements when appropriate
+            """
+
+        # Дополнительные опции
+        additional_options = ""
+        if meta.get('includeAnswers', True):
+            additional_options += "- Include COMPLETE ANSWER KEYS for all exercises with explanations\n"
+        if meta.get('includeInstructions', True):
+            additional_options += "- Include DETAILED TEACHER INSTRUCTIONS with step-by-step implementation guide\n"
+        if meta.get('adaptiveDifficulty', False):
+            additional_options += "- Provide variations for different proficiency levels within the same exercise\n"
+
+        # Выбранные типы упражнений из метаданных
+        selected_types = meta.get('selectedTypes', [])
+        types_instruction = self._get_exercise_types_instruction(selected_types)
+
+        # Выбранные форматы упражнений
+        selected_formats = meta.get('selectedFormats', [])
+        formats_instruction = self._get_exercise_formats_instruction(selected_formats)
+
+        # Игровые элементы
+        gamification = meta.get('gamification', [])
+        gamification_instruction = self._get_gamification_instruction(gamification)
+
+        # Тематические элементы
+        theme = meta.get('theme', '')
+        theme_instruction = ""
+        if theme:
+            theme_instruction = f"""
+THEME INTEGRATION:
+- Incorporate the theme "{theme}" throughout all exercises
+- Use vocabulary, examples, and contexts related to this theme
+- Make the theme central to the learning experience
+            """
+
+        # Основной шаблон промпта
+        prompt_template = """
+Create EXACTLY {quantity} COMPLETE and DETAILED exercises for {language} language learners.
+
+⚠️ IMPORTANT: Generate EXACTLY {quantity} exercises - no more, no less!
+
+TOPIC: {topic}
+PROFICIENCY LEVEL: {proficiency}
+EXERCISE TYPE: {exercise_type}
+
+{level_instruction}
+
+{types_instruction}
+{formats_instruction}
+{theme_instruction}
+{gamification_instruction}
+{format_instruction}
+{online_instruction}
+
+CRITICAL REQUIREMENTS FOR EACH EXERCISE:
+1. **Exercise Title** - Clear, descriptive title (e.g., "Exercise 1: Present Simple Practice")
+2. **Learning Objectives** - What students will achieve
+3. **Step-by-Step Instructions** - Detailed student instructions
+4. **Complete Exercise Content** - Full tasks, not just descriptions
+5. **Worked Examples** - Show students exactly what to do
+6. **Answer Keys** - Complete solutions with explanations
+7. **Teacher Notes** - Implementation tips and common mistakes to watch for
+
+{additional_options}
+
+FORMATTING REQUIREMENTS:
+- Number each exercise clearly: "Exercise 1:", "Exercise 2:", etc.
+- Separate each exercise with clear dividers
+- Include all required sections for each exercise
+- Make each exercise self-contained and complete
+
+QUANTITY CONTROL:
+- You must create EXACTLY {quantity} exercises
+- Count your exercises before finishing
+- If you have fewer than {quantity}, add more
+- If you have more than {quantity}, remove the extras
+
+QUALITY STANDARDS:
+- Each exercise must be COMPLETE and READY TO USE
+- Include specific examples, not general descriptions
+- Provide enough content for meaningful practice
+- Ensure exercises build on each other logically
+- Make instructions crystal clear for students
+        """
+
+        return prompt_template.format(
+            quantity=params.get('quantity', 3),
+            language=params.get('language', 'English'),
+            topic=params.get('topic', 'General'),
+            proficiency=proficiency,
+            exercise_type=params.get('exercise_type', 'grammar'),
+            level_instruction=level_instruction,
+            types_instruction=types_instruction,
+            formats_instruction=formats_instruction,
+            theme_instruction=theme_instruction,
+            gamification_instruction=gamification_instruction,
+            format_instruction=format_instruction,
+            online_instruction=online_instruction,
+            additional_options=additional_options
+        )
+
+    def _get_cefr_level_instruction(self, proficiency: str) -> str:
+        """Get detailed CEFR level-specific instructions for exercise generation"""
+
+        # Нормализуем уровень
+        proficiency_lower = proficiency.lower()
+
+        # Маппинг различных форматов уровней к стандартным CEFR
+        level_mapping = {
+            'beginner': 'a1',
+            'elementary': 'a2',
+            'pre-intermediate': 'a2',
+            'intermediate': 'b1',
+            'upper-intermediate': 'b2',
+            'upper_intermediate': 'b2',
+            'advanced': 'c1',
+            'proficiency': 'c2',
+            'a1': 'a1',
+            'a2': 'a2',
+            'b1': 'b1',
+            'b2': 'b2',
+            'c1': 'c1',
+            'c2': 'c2'
+        }
+
+        cefr_level = level_mapping.get(proficiency_lower, 'b1')
+
+        level_instructions = {
+            'a1': """
+LEVEL: A1 (BEGINNER) - DETAILED REQUIREMENTS:
+
+VOCABULARY:
+- Use only the most basic, high-frequency words (family, numbers, colors, days, food)
+- Limit vocabulary to 500-1000 most common words
+- Provide clear definitions or visual aids for any new words
+- Use cognates and international words when possible
+
+GRAMMAR:
+- Present simple tense only (I am, I have, I like)
+- Basic question forms (What is...? Where is...?)
+- Simple negatives (I don't like, It's not...)
+- Basic prepositions (in, on, at)
+- Singular/plural nouns (book/books)
+
+EXERCISE COMPLEXITY:
+- Single-step tasks only
+- Clear, simple instructions (max 10 words)
+- Lots of examples and visual support
+- Repetitive practice with slight variations
+- Yes/No and multiple choice questions
+- Matching exercises with pictures/words
+
+LANGUAGE OF INSTRUCTIONS:
+- Use very simple English
+- Short sentences (max 8 words)
+- Present tense only
+- Avoid complex grammar in instructions
+            """,
+
+            'a2': """
+LEVEL: A2 (ELEMENTARY) - DETAILED REQUIREMENTS:
+
+VOCABULARY:
+- Expand to 1000-2000 common words
+- Include basic adjectives, adverbs, and connectors
+- Introduce topic-specific vocabulary gradually
+- Use simple definitions in English
+
+GRAMMAR:
+- Past simple regular and irregular verbs
+- Future with 'going to' and 'will'
+- Present continuous for current actions
+- Comparative and superlative adjectives
+- Basic modal verbs (can, must, should)
+- Simple conditionals (If I have time...)
+
+EXERCISE COMPLEXITY:
+- Two-step tasks maximum
+- Clear sequencing (First... Then... Finally...)
+- Gap-fill exercises with word banks
+- Simple sentence transformation
+- Basic reading comprehension with factual questions
+- Short dialogues and role-plays
+
+LANGUAGE OF INSTRUCTIONS:
+- Simple but complete sentences
+- Use familiar vocabulary in instructions
+- Provide examples for each task type
+            """,
+
+            'b1': """
+LEVEL: B1 (INTERMEDIATE) - DETAILED REQUIREMENTS:
+
+VOCABULARY:
+- 2000-3000 words including abstract concepts
+- Topic-specific vocabulary for common themes
+- Phrasal verbs and basic idioms
+- Formal and informal register awareness
+
+GRAMMAR:
+- All major tenses including perfect aspects
+- Passive voice in common situations
+- Reported speech for statements and questions
+- Complex conditionals (2nd and 3rd conditional)
+- Relative clauses (who, which, that, where)
+- Advanced modal verbs and their meanings
+
+EXERCISE COMPLEXITY:
+- Multi-step tasks requiring planning
+- Text analysis and inference questions
+- Opinion-based discussions with justification
+- Problem-solving activities
+- Creative writing with guided structure
+- Listening for specific information and gist
+
+LANGUAGE OF INSTRUCTIONS:
+- Natural, fluent English
+- Complex sentence structures acceptable
+- Assume understanding of common academic vocabulary
+            """,
+
+            'b2': """
+LEVEL: B2 (UPPER-INTERMEDIATE) - DETAILED REQUIREMENTS:
+
+VOCABULARY:
+- 3000-4000 words including specialized terminology
+- Advanced phrasal verbs and idiomatic expressions
+- Nuanced vocabulary for expressing opinions and emotions
+- Academic and professional vocabulary
+
+GRAMMAR:
+- Advanced tenses and aspects in context
+- Complex passive constructions
+- Advanced conditionals and hypothetical situations
+- Sophisticated linking devices and discourse markers
+- Advanced modal verbs for speculation and deduction
+- Inversion and emphasis structures
+
+EXERCISE COMPLEXITY:
+- Extended tasks requiring sustained effort
+- Critical thinking and analysis activities
+- Debate and argumentation exercises
+- Research-based projects
+- Creative and analytical writing
+- Complex listening with multiple speakers and accents
+
+LANGUAGE OF INSTRUCTIONS:
+- Sophisticated language acceptable
+- Academic style instructions
+- Minimal scaffolding required
+            """,
+
+            'c1': """
+LEVEL: C1 (ADVANCED) - DETAILED REQUIREMENTS:
+
+VOCABULARY:
+- 4000+ words including low-frequency and specialized terms
+- Sophisticated idiomatic expressions and metaphors
+- Academic and professional register mastery
+- Cultural references and allusions
+
+GRAMMAR:
+- Mastery of all grammatical structures
+- Subtle distinctions in meaning and usage
+- Advanced stylistic devices
+- Complex sentence structures with multiple clauses
+- Sophisticated discourse organization
+
+EXERCISE COMPLEXITY:
+- Extended, autonomous tasks
+- Abstract and theoretical concepts
+- Independent research and presentation
+- Critical evaluation and synthesis
+- Creative and academic writing at advanced level
+- Complex authentic materials (lectures, academic texts)
+
+LANGUAGE OF INSTRUCTIONS:
+- Native-like complexity acceptable
+- Minimal explicit instruction needed
+- Focus on refinement and sophistication
+            """,
+
+            'c2': """
+LEVEL: C2 (PROFICIENCY) - DETAILED REQUIREMENTS:
+
+VOCABULARY:
+- Near-native vocabulary range (5000+ words)
+- Subtle nuances and connotations
+- Specialized terminology across multiple fields
+- Literary and archaic expressions
+- Regional and stylistic variations
+
+GRAMMAR:
+- Native-like control of all structures
+- Subtle grammatical distinctions
+- Stylistic and rhetorical effects
+- Complex discourse patterns
+- Implicit and explicit meaning
+
+EXERCISE COMPLEXITY:
+- Highly complex, authentic tasks
+- Abstract reasoning and analysis
+- Independent critical thinking
+- Sophisticated communication skills
+- Professional and academic contexts
+- Cultural and literary analysis
+
+LANGUAGE OF INSTRUCTIONS:
+- Native-speaker level complexity
+- Sophisticated academic language
+- Implicit understanding assumed
+            """
+        }
+
+        return level_instructions.get(cefr_level, level_instructions['b1'])
+
+    def _get_exercise_types_instruction(self, selected_types: List[str]) -> str:
+        """Get detailed instructions for selected exercise types"""
+        if not selected_types:
+            return ""
+
+        type_instructions = {
+            'story': """
+STORY-BASED EXERCISES:
+- Create engaging narratives relevant to the topic
+- Include character development and plot progression
+- Use stories to introduce and practice new vocabulary/grammar
+- Add comprehension questions about plot, characters, and themes
+- Include creative writing extensions (alternative endings, character perspectives)
+            """,
+
+            'roleplay': """
+ROLE-PLAYING EXERCISES:
+- Design realistic scenarios for language practice
+- Provide clear character descriptions and motivations
+- Include specific language functions (asking for help, making complaints, etc.)
+- Add preparation time and follow-up discussion questions
+- Ensure roles are appropriate for the proficiency level
+            """,
+
+            'quiz': """
+INTERACTIVE QUIZ EXERCISES:
+- Create varied question types (multiple choice, true/false, short answer)
+- Include immediate feedback and explanations
+- Progress from easier to more challenging questions
+- Add bonus questions for advanced learners
+- Include visual elements where appropriate
+            """,
+
+            'game': """
+LANGUAGE GAME EXERCISES:
+- Design competitive or collaborative game elements
+- Include clear rules and scoring systems
+- Add time limits for excitement and challenge
+- Ensure games reinforce learning objectives
+- Provide variations for different group sizes
+            """,
+
+            'project': """
+CREATIVE PROJECT EXERCISES:
+- Design multi-step creative tasks
+- Include research and presentation components
+- Allow for personal expression and creativity
+- Provide clear assessment criteria
+- Include peer feedback opportunities
+            """,
+
+            'media': """
+MEDIA CREATION EXERCISES:
+- Include video, audio, or digital content creation
+- Provide technical guidance and templates
+- Focus on communication skills through media
+- Include planning and scripting phases
+- Add sharing and feedback components
+            """
+        }
+
+        instructions = []
+        for exercise_type in selected_types:
+            if exercise_type in type_instructions:
+                instructions.append(type_instructions[exercise_type])
+
+        if instructions:
+            return "SELECTED EXERCISE TYPES:\n" + "\n".join(instructions)
+        return ""
+
+    def _get_exercise_formats_instruction(self, selected_formats: List[str]) -> str:
+        """Get detailed instructions for selected exercise formats"""
+        if not selected_formats:
+            return ""
+
+        format_instructions = {
+            'gap_fill': """
+GAP-FILL FORMAT:
+- Use short underscores (____) or numbered blanks (1), (2), (3)
+- Maximum 5-10 underscores per gap
+- Provide word banks when appropriate
+- Include both grammar and vocabulary gaps
+- Add context clues to help students
+- Provide complete answer keys with explanations
+            """,
+
+            'sentence_building': """
+SENTENCE BUILDING FORMAT:
+- Provide scrambled words or phrases
+- Include punctuation guidance
+- Start with shorter sentences, progress to longer ones
+- Add visual cues or prompts when helpful
+- Include multiple correct possibilities when appropriate
+- Show word order rules explicitly
+            """,
+
+            'open_brackets': """
+OPEN BRACKETS FORMAT:
+- Provide words in brackets to be transformed
+- Include clear instructions for each transformation
+- Cover verb tenses, word forms, and grammatical changes
+- Provide examples of the transformation type
+- Include answer keys with explanations of rules
+- Progress from simple to complex transformations
+            """,
+
+            'sentence_matching': """
+SENTENCE MATCHING FORMAT:
+- Create logical connections between sentence parts
+- Include distractors to increase difficulty
+- Use clear formatting (numbers and letters)
+- Ensure only one correct match per item
+- Add context or theme to make matching meaningful
+- Include answer keys with explanations
+            """,
+
+            'word_definition': """
+WORD-DEFINITION MATCHING FORMAT:
+- Use vocabulary appropriate for the level
+- Include both simple and complex definitions
+- Add example sentences for context
+- Include synonyms and antonyms when relevant
+- Use clear, unambiguous definitions
+- Provide pronunciation guides when needed
+            """
+        }
+
+        instructions = []
+        for format_type in selected_formats:
+            if format_type in format_instructions:
+                instructions.append(format_instructions[format_type])
+
+        if instructions:
+            return "SELECTED EXERCISE FORMATS:\n" + "\n".join(instructions)
+        return ""
+
+    def _get_gamification_instruction(self, gamification_elements: List[str]) -> str:
+        """Get instructions for incorporating gamification elements"""
+        if not gamification_elements:
+            return ""
+
+        gamification_instructions = {
+            'points': """
+POINTS SYSTEM:
+- Assign point values to different tasks (easy=1, medium=2, hard=3)
+- Include bonus points for creativity or extra effort
+- Create point thresholds for achievements
+- Track cumulative points across exercises
+            """,
+
+            'badges': """
+ACHIEVEMENT BADGES:
+- Design specific achievements (Grammar Master, Vocabulary Champion, etc.)
+- Include both skill-based and effort-based badges
+- Create visual representations of achievements
+- Add badge collection and display elements
+            """,
+
+            'levels': """
+LEVEL SYSTEM:
+- Create progressive difficulty levels within exercises
+- Include level-up criteria and rewards
+- Design branching paths for different abilities
+- Add level indicators and progress tracking
+            """,
+
+            'rewards': """
+REWARD SYSTEM:
+- Include immediate feedback and positive reinforcement
+- Create unlockable content or privileges
+- Add surprise elements and bonus rewards
+- Design meaningful, education-related rewards
+            """,
+
+            'challenges': """
+CHALLENGE ELEMENTS:
+- Include time-based challenges and competitions
+- Create team vs. individual challenges
+- Add difficulty spikes and special tasks
+- Include leaderboards and progress comparison
+            """,
+
+            'streaks': """
+STREAK SYSTEM:
+- Track consecutive correct answers or daily practice
+- Include streak bonuses and multipliers
+- Add streak recovery mechanisms
+- Create streak-based achievements and rewards
+            """
+        }
+
+        instructions = []
+        for element in gamification_elements:
+            if element in gamification_instructions:
+                instructions.append(gamification_instructions[element])
+
+        if instructions:
+            return "GAMIFICATION ELEMENTS:\n" + "\n".join(instructions)
+        return ""
+
+    def _structure_exercises(self, content: str) -> List[Dict[str, Any]]:
+        """Structure the raw generated content into exercises"""
+        exercises = []
+
+        # Журналирование для отладки
+        logger.info(f"Начало парсинга упражнений. Длина контента: {len(content)} символов")
+
+        try:
+            # Проверка наличия разделов ответов и инструкций
+            has_answers = "answers" in content.lower() or "answer key" in content.lower() or "answer keys" in content.lower()
+            has_instructions = "teacher instructions" in content.lower() or "teaching notes" in content.lower()
+
+            logger.info(f"Определение секций: answers={has_answers}, instructions={has_instructions}")
+
+            # Пытаемся разделить контент на упражнения по маркерам
+            # Проверяем различные формы маркеров упражнений
+            if "exercise" in content.lower():
+                sections = re.split(r"(?i)## Exercise \d+:", content)
+                logger.info(f"Разделение по 'Exercise N': получено {len(sections)} секций")
+            elif "упражнение" in content.lower():
+                sections = re.split(r"(?i)упражнение\s*\d+[\.:]?", content)
+                logger.info(f"Разделение по 'Упражнение N': получено {len(sections)} секций")
+            else:
+                # Если не нашли стандартных маркеров, рассматриваем весь текст как одно упражнение
+                logger.info(f"Не найдены стандартные маркеры упражнений. Возвращаем весь контент как одно упражнение.")
+                return [{
+                    "type": "general",
+                    "content": content,
+                    "answers": "",
+                    "instructions": ""
+                }]
+
+            # Убираем первую пустую секцию, если она есть
+            if sections and not sections[0].strip():
+                sections = sections[1:]
+
+            if not sections:
+                logger.warning("После разделения не найдено упражнений. Возвращаем весь контент как одно упражнение.")
+                return [{
+                    "type": "general",
+                    "content": content,
+                    "answers": "",
+                    "instructions": ""
+                }]
+
+            # Обрабатываем каждую секцию
+            for i, section in enumerate(sections, 1):
+                if not section.strip():
+                    continue
+
+                logger.info(f"Обработка упражнения {i}, длина секции: {len(section)} символов")
+
+                exercise = {
+                    "type": "general",
+                    "content": "",
+                    "answers": "",
+                    "instructions": ""
+                }
+
+                # Ищем секцию ответов (может быть в разных форматах)
+                answer_patterns = [
+                    r"(?i)###\s*answer\s*keys?.*?$",
+                    r"(?i)answer\s*keys?:?.*?$",
+                    r"(?i)answers:?.*?$",
+                    r"(?i)ответы:?.*?$",
+                    r"(?i)solutions?:?.*?$"
+                ]
+
+                # Ищем секцию инструкций
+                instruction_patterns = [
+                    r"(?i)###\s*teacher\s*instructions.*?$",
+                    r"(?i)teacher\s*instructions:?.*?$",
+                    r"(?i)teaching\s*notes:?.*?$",
+                    r"(?i)инструкции\s*для\s*учителя:?.*?$",
+                    r"(?i)notes\s*for\s*teacher:?.*?$"
+                ]
+
+                content_parts = {}
+                current_section = section
+
+                # Извлекаем ответы
+                answers_match = None
+                for pattern in answer_patterns:
+                    matches = re.search(pattern, current_section, re.MULTILINE)
+                    if matches:
+                        answers_match = matches
+                        break
+
+                if answers_match:
+                    split_pos = answers_match.start()
+                    content_parts['content'] = current_section[:split_pos].strip()
+                    content_parts['answers'] = current_section[split_pos:].strip()
+                    current_section = content_parts['content']  # Обновляем текущую секцию для дальнейшего поиска
+                else:
+                    content_parts['content'] = current_section
+                    content_parts['answers'] = ""
+
+                # Извлекаем инструкции
+                instructions_match = None
+                for pattern in instruction_patterns:
+                    matches = re.search(pattern, current_section, re.MULTILINE)
+                    if matches:
+                        instructions_match = matches
+                        break
+
+                if instructions_match:
+                    split_pos = instructions_match.start()
+                    # Обновляем содержимое, отделяя инструкции
+                    content_parts['instructions'] = current_section[split_pos:].strip()
+                    content_parts['content'] = current_section[:split_pos].strip()
+                else:
+                    content_parts['instructions'] = ""
+
+                # Если в ответах есть инструкции, обрабатываем их
+                for pattern in instruction_patterns:
+                    if content_parts['answers']:
+                        matches = re.search(pattern, content_parts['answers'], re.MULTILINE)
+                        if matches:
+                            split_pos = matches.start()
+                            content_parts['instructions'] = content_parts['answers'][split_pos:].strip()
+                            content_parts['answers'] = content_parts['answers'][:split_pos].strip()
+                            break
+
+                # Заполняем данные упражнения
+                exercise['content'] = content_parts['content'].strip()
+                exercise['answers'] = content_parts['answers'].strip()
+                exercise['instructions'] = content_parts['instructions'].strip()
+
+                # Определяем тип упражнения (если возможно)
+                exercise_type_patterns = {
+                    "grammar": r"(?i)(grammar|грамматик|tense|время|артикл|предлог|союз|синтакс)",
+                    "vocabulary": r"(?i)(vocabulary|словар|лексик|слов|term|термин)",
+                    "reading": r"(?i)(reading|чтени|текст|passage|отрыв)",
+                    "writing": r"(?i)(writing|письм|composition|сочинени|эссе|essay)",
+                    "speaking": r"(?i)(speaking|говорени|диалог|монолог|conversation|разговор)",
+                    "listening": r"(?i)(listening|аудировани|слушани)"
+                }
+
+                for type_key, pattern in exercise_type_patterns.items():
+                    if re.search(pattern, exercise['content']):
+                        exercise['type'] = type_key
+                        break
+
+                # Логируем результат
+                logger.info(f"Упражнение {i} обработано: {len(exercise['content'])} символов контента, " +
+                           f"{len(exercise['answers'])} символов ответов, {len(exercise['instructions'])} символов инструкций")
+
+                exercises.append(exercise)
+
+            logger.info(f"Успешно обработано {len(exercises)} упражнений")
+            return exercises
+
+        except Exception as e:
+            logger.error(f"Ошибка при обработке структуры упражнений: {str(e)}")
+            # В случае ошибки возвращаем весь контент как одно упражнение
+            return [{
+                "type": "general",
+                "content": content,
+                "answers": "",
+                "instructions": ""
+            }]
+    @memory_optimized()
+    async def generate_game(
+            self,
+            user_id: int,
+            params: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Generate game with optimization"""
+        try:
+            # Check parameters
+            self._validate_game_params(params)
+
+            # Create prompt
+            prompt = self._create_game_prompt(params)
+
+            # Generate content through queue
+            content = await self.generate_content(
+                content_type=ContentType.GAME,
+                prompt=prompt,
+                user_id=user_id,
+                extra_params=params
+            )
+
+            # Structure game
+            game = self._structure_game(content)
+
+            return game
+
+        except Exception as e:
+            logger.error(f"Error generating game: {str(e)}")
+            raise
+
+    def _validate_game_params(self, params: Dict[str, Any]) -> None:
+        """Validate parameters for game generation"""
+        required_params = ['language', 'topic', 'game_type', 'duration']
+        for param in required_params:
+            if param not in params:
+                raise ValidationError(f"Missing required parameter: {param}")
+
+        if not 5 <= params.get('duration', 0) <= 60:
+            raise ValidationError("Duration must be between 5 and 60 minutes")
+
+        # Проверяем формат игры, если он указан
+        if 'format' in params and params['format'] not in ['individual', 'group']:
+            raise ValidationError("Format must be either 'individual' or 'group'")
+
+        # Проверяем тип контента, если он отсутствует, добавляем его
+        if 'type' not in params:
+            params['type'] = ContentType.GAME
+
+    def _create_game_prompt(self, params: Dict[str, Any]) -> str:
+        """Create prompt for game generation with multilingual approach"""
+
+        # Получаем язык обучения
+        target_language = params.get('language', 'English')
+
+        # Определяем название языка на русском
+        language_names_russian = {
+            'english': 'английского языка',
+            'spanish': 'испанского языка',
+            'french': 'французского языка',
+            'german': 'немецкого языка',
+            'italian': 'итальянского языка',
+            'chinese': 'китайского языка',
+            'japanese': 'японского языка',
+            'korean': 'корейского языка',
+            'turkish': 'турецкого языка',
+            'arabic': 'арабского языка',
+            'portuguese': 'португальского языка',
+            'dutch': 'голландского языка',
+            'polish': 'польского языка',
+            'czech': 'чешского языка',
+            'hungarian': 'венгерского языка',
+            'finnish': 'финского языка',
+            'swedish': 'шведского языка',
+            'norwegian': 'норвежского языка',
+            'danish': 'датского языка',
+            'greek': 'греческого языка',
+            'hebrew': 'иврита',
+            'hindi': 'хинди',
+            'thai': 'тайского языка',
+            'vietnamese': 'вьетнамского языка',
+            'ukrainian': 'украинского языка',
+            'bulgarian': 'болгарского языка',
+            'croatian': 'хорватского языка',
+            'serbian': 'сербского языка',
+            'slovenian': 'словенского языка',
+            'slovak': 'словацкого языка',
+            'lithuanian': 'литовского языка',
+            'latvian': 'латышского языка',
+            'estonian': 'эстонского языка',
+            'romanian': 'румынского языка'
+        }
+
+        language_name_russian = language_names_russian.get(target_language.lower(), f'{target_language} языка')
+
+        # Определяем формат игры (индивидуальный или групповой)
+        format_instruction = ""
+        if params.get('format') == 'individual':
+            format_instruction = "Эта игра должна быть разработана для индивидуальной игры (один ученик с учителем)."
+        elif params.get('format') == 'group':
+            format_instruction = "Эта игра должна быть разработана для групповой игры (несколько учеников)."
+
+        prompt_template = f"""
+        ВАЖНО: Создай игру для обучения {language_name_russian} для русскоговорящих учителей.
+
+        КРИТИЧЕСКИ ВАЖНО - ЯЗЫКОВОЕ РАЗДЕЛЕНИЕ:
+        - ВСЕ ИНСТРУКЦИИ ДЛЯ УЧИТЕЛЯ должны быть написаны на РУССКОМ языке
+        - ВСЕ ИГРОВЫЕ МАТЕРИАЛЫ И ЗАДАНИЯ ДЛЯ УЧЕНИКОВ должны быть написаны на {target_language.upper()} языке
+        - Правила игры и объяснения - на русском для учителя
+        - Карточки, вопросы, задания - на {target_language.upper()} для учеников
+
+        Параметры игры:
+        - Тип игры: {{game_type}}
+        - Тема: {{topic}}
+        - Продолжительность: {{duration}} минут
+        - Возрастная группа: {{age_group}}
+        {{format_instruction}}
+
+        Включи следующие разделы:
+        1. Название игры (на русском)
+        2. Необходимые материалы (описание на русском)
+        3. Инструкции по подготовке (на русском для учителя)
+        4. Правила игры (на русском для учителя)
+        5. Система подсчета очков (на русском)
+        6. Вариации игры (опционально, на русском)
+
+        Игровые материалы (карточки, вопросы, задания) должны быть на {target_language.upper()} языке.
+        Сделай игру увлекательной, интерактивной и подходящей для изучения языка.
+        """
+
+        return prompt_template.format(
+            game_type=params.get('game_type', 'языковая'),
+            topic=params.get('topic', 'Общая тема'),
+            duration=params.get('duration', 15),
+            age_group=params.get('age_group', 'взрослые'),
+            format_instruction=format_instruction
+        )
+
+    def _structure_game(self, content: str) -> Dict[str, Any]:
+        """Structure the raw generated content into a game format"""
+        game = {
+            "title": "",
+            "materials": [],
+            "setup": "",
+            "rules": "",
+            "scoring": "",
+            "variations": []
+        }
+
+        # Basic parsing
+        lines = content.split('\n')
+        current_section = None
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+
+            lower_line = line.lower()
+            if game["title"] == "" and current_section is None:
+                game["title"] = line
+                continue
+            elif "materials" in lower_line or "requirements" in lower_line:
+                current_section = "materials"
+                continue
+            elif "setup" in lower_line or "preparation" in lower_line:
+                current_section = "setup"
+                continue
+            elif "rules" in lower_line or "how to play" in lower_line:
+                current_section = "rules"
+                continue
+            elif "scoring" in lower_line or "points" in lower_line:
+                current_section = "scoring"
+                continue
+            elif "variations" in lower_line or "alternatives" in lower_line:
+                current_section = "variations"
+                continue
+
+            if current_section == "materials" and line.startswith("- "):
+                game["materials"].append(line[2:])
+            elif current_section == "setup":
+                game["setup"] += line + "\n"
+            elif current_section == "rules":
+                game["rules"] += line + "\n"
+            elif current_section == "scoring":
+                game["scoring"] += line + "\n"
+            elif current_section == "variations" and line.startswith("- "):
+                game["variations"].append(line[2:])
+
+        return game
+
+    @memory_optimized()
+    async def generate_image(
+            self,
+            user_id: int,
+            prompt: str,
+            params: Optional[Dict[str, Any]] = None,
+            use_cache: bool = True,
+            force_queue: bool = False
+    ) -> str:
+        """Generate image with optimization"""
+        try:
+            # Проверяем, является ли это генерацией за баллы
+            is_points_based = False
+            if params and 'with_points' in params:
+                is_points_based = params.get('with_points', False)
+                # Если генерация за баллы, принудительно отключаем кэширование
+                if is_points_based:
+                    use_cache = False
+                    logger.info(f"Points-based image generation detected, cache forcibly disabled")
+
+            # Проверяем, есть ли явное указание на отключение кэша в параметрах
+            if params and 'use_cache' in params:
+                use_cache_param = params.get('use_cache', True)
+                if not use_cache_param:
+                    use_cache = False
+                    logger.info(f"Cache disabled via params, use_cache={use_cache}")
+
+            # Создаем уникальный промпт для points-based генерации
+            original_prompt = prompt
+            modified_prompt = prompt
+
+            # Для генерации за баллы или при отключенном кэше всегда добавляем уникальные модификаторы
+            if not use_cache or is_points_based:
+                import time
+                import random
+                timestamp = int(time.time())
+                random_num = random.randint(1000, 9999)
+
+                # Добавляем уникальный суффикс к промпту, если его еще нет
+                if "[t:" not in prompt and "[seed:" not in prompt and "[time:" not in prompt:
+                    # Для points-based генерации добавляем более существенные модификаторы к промпту
+                    # чтобы гарантировать уникальность результата
+
+                    # Добавляем случайный цвет и стиль для большей вариативности
+                    colors = ["red", "blue", "green", "yellow", "purple", "orange", "teal", "pink", "gold", "silver"]
+                    styles = ["digital art", "watercolor", "oil painting", "sketch", "3D render", "cartoon", "realistic", "minimalist"]
+                    angles = ["front view", "side view", "top view", "perspective view", "close-up"]
+                    lighting = ["soft lighting", "dramatic lighting", "natural light", "studio light", "backlight"]
+
+                    random_color = colors[random.randint(0, len(colors)-1)]
+                    random_style = styles[random.randint(0, len(styles)-1)]
+                    random_angle = angles[random.randint(0, len(angles)-1)]
+                    random_lighting = lighting[random.randint(0, len(lighting)-1)]
+
+                    # Добавляем случайные модификаторы и технический суффикс с большей энтропией
+                    unique_suffix = f", hint of {random_color}, {random_style} style, {random_angle}, {random_lighting} [seed:{random_num}:time:{timestamp}:rand:{random.randint(1000, 9999)}:u:{random.randint(10000, 99999)}:r:{random.random()}]"
+                    modified_prompt = f"{prompt}{unique_suffix}"
+                    logger.info(f"Added uniqueness suffix to prompt: {unique_suffix}")
+
+            # Определяем cache_key на основе оригинального или модифицированного промпта
+            if not use_cache or is_points_based:
+                # Для points-based генерации используем уникальный ключ с временной меткой
+                import time
+                import random
+                timestamp = int(time.time())
+                random_num = random.randint(1000, 9999)
+                # Используем и оригинальный промпт и временную метку для уникальности
+                cache_key = f"image:{hashlib.md5(original_prompt.encode()).hexdigest()}:points:{timestamp}:{random_num}:{random.random()}"
+                logger.info(f"Using unique cache key for points-based/no-cache generation: {cache_key}")
+            else:
+                cache_key = f"image:{hashlib.md5(original_prompt.encode()).hexdigest()}"
+
+            # Check cache only if use_cache is True
+            if use_cache:
+                logger.info(f"Checking cache for image with key: {cache_key}")
+                cached_image = await self.cache_service.get_cached_data(cache_key)
+                if cached_image:
+                    logger.info(f"Using cached image for prompt hash: {cache_key}")
+                    return cached_image
+            else:
+                logger.info(f"Cache disabled for image generation, skipping cache check")
+
+            # Обновляем параметры для передачи в generate_content
+            if params is None:
+                params = {}
+
+            # Явно указываем параметры кэширования и генерации за баллы
+            params['use_cache'] = use_cache
+            params['with_points'] = is_points_based
+            # Всегда включаем рандомизацию для points-based генерации
+            params['randomize_seed'] = not use_cache or is_points_based
+
+            # Для points-based генерации добавляем дополнительные параметры для большей вариативности
+            if is_points_based:
+                # Добавляем случайный seed для каждой генерации с points
+                params['seed'] = random.randint(1000000, 9999999)
+                # Принудительно отключаем кэширование для points-based генерации
+                params['use_cache'] = False
+                # Принудительно включаем рандомизацию для points-based генерации
+                params['randomize_seed'] = True
+                # Добавляем временную метку для уникальности
+                params['timestamp'] = int(time.time())
+                # Добавляем случайное число для уникальности
+                params['random'] = random.random()
+                logger.info(f"Points-based generation: forcing randomize_seed=True, use_cache=False, seed={params['seed']}, timestamp={params['timestamp']}")
+
+            logger.info(f"Passing updated params to generate_content: {params}")
+
+            # Generate image using the new image service
+            try:
+                logger.info("🔄 Attempting to use new ImageGenerationService...")
+                from .image_generator import image_service
+
+                if image_service is None:
+                    raise Exception("ImageGenerationService is not available (initialization failed)")
+
+                logger.info("✅ Successfully imported image_service")
+
+                # Параметры изображения
+                width = params.get('width', 1024) if params else 1024
+                height = params.get('height', 1024) if params else 1024
+                save_locally = params.get('save_locally', True) if params else True
+
+                logger.info(f"🎨 Calling image_service.generate_image with prompt: {modified_prompt[:100]}...")
+
+                # Генерируем изображение через новый сервис
+                result = await image_service.generate_image(
+                    prompt=modified_prompt,  # Используем модифицированный промпт
+                    user_id=user_id,
+                    width=width,
+                    height=height,
+                    save_locally=save_locally
+                )
+
+                image_url = result['url']
+                provider_used = result.get('provider_used', 'unknown')
+
+                logger.info(f"✅ Image generated successfully with {provider_used}. URL: {image_url}")
+
+            except Exception as e:
+                logger.error(f"❌ New image service failed, falling back to old method: {e}")
+                import traceback
+                logger.error(f"Traceback: {traceback.format_exc()}")
+                # Fallback to old method
+                logger.info("🔄 Using fallback G4F method...")
+                image_url = await self.generate_content(
+                    content_type=ContentType.IMAGE,
+                    prompt=modified_prompt,  # Используем модифицированный промпт
+                    user_id=user_id,
+                    extra_params=params,
+                    use_cache=use_cache,
+                    force_queue=force_queue
+                )
+
+            # Save image information with both original and modified prompts
+            image = Image(
+                user_id=user_id,
+                url=image_url,
+                prompt=original_prompt,  # Сохраняем оригинальный промпт
+                created_at=datetime.now(timezone.utc)
+            )
+            self.session.add(image)
+            await self.session.flush()
+
+            # Cache result only if use_cache is True and not points-based generation
+            if use_cache and not is_points_based:
+                logger.info(f"Caching image result with key: {cache_key}")
+                await self.cache_service.cache_data(cache_key, image_url, ttl=3600)
+            else:
+                logger.info(f"Cache disabled for image generation (use_cache={use_cache}, points_based={is_points_based}), skipping result caching")
+
+            return image_url
+
+        except Exception as e:
+            logger.error(f"Error generating image: {str(e)}")
+            raise
+
+    async def _generate_with_g4f(self, prompt: str, content_type: ContentType) -> Optional[str]:
+        """
+        Генерирует контент с использованием доступных провайдеров
+        в порядке приоритета: Gemini -> OpenRouter -> Groq -> Mistral -> G4F
+
+        Args:
+            prompt: Текст промпта для генерации
+            content_type: Тип контента
+
+        Returns:
+            Optional[str]: Сгенерированный текст или None в случае ошибки
+        """
+        try:
+            # Адаптируем промпт в зависимости от типа контента
+            if content_type == ContentType.IMAGE:
+                logger.info(f"Генерация изображения с использованием специализированных провайдеров")
+                # Для изображений используем специальный метод
+                if self.g4f_handler:
+                    # Получаем параметры из extra_params, если они есть
+                    use_cache = True
+                    is_points_based = False
+                    randomize_seed = False
+
+                    if hasattr(self, '_current_extra_params') and self._current_extra_params:
+                        if 'use_cache' in self._current_extra_params:
+                            use_cache = self._current_extra_params.get('use_cache', True)
+                            logger.info(f"Using cache parameter from extra_params: {use_cache}")
+
+                        # Проверяем, является ли это генерацией за баллы
+                        if 'with_points' in self._current_extra_params:
+                            is_points_based = self._current_extra_params.get('with_points', False)
+                            if is_points_based:
+                                # Для генерации за баллы принудительно отключаем кэширование
+                                use_cache = False
+                                logger.info(f"Points-based image generation detected in _generate_with_g4f, cache forcibly disabled")
+
+                        # Проверяем, есть ли явное указание на randomize_seed
+                        if 'randomize_seed' in self._current_extra_params:
+                            randomize_seed = self._current_extra_params.get('randomize_seed', False)
+                            logger.info(f"Using randomize_seed parameter from extra_params: {randomize_seed}")
+
+                    # Если randomize_seed не указан явно, определяем его на основе use_cache и is_points_based
+                    if not randomize_seed:
+                        randomize_seed = not use_cache or is_points_based
+
+                    logger.info(f"Generating image with randomize_seed={randomize_seed}, use_cache={use_cache}, is_points_based={is_points_based}")
+
+                    image_url = await self.g4f_handler.generate_image(
+                        prompt=prompt,
+                        use_cache=use_cache,
+                        randomize_seed=randomize_seed
+                    )
+                    return image_url
+                else:
+                    logger.error("G4FHandler не инициализирован для генерации изображений")
+                    return "Не удалось сгенерировать изображение. Провайдер недоступен."
+            else:
+                # Для текстового контента выбираем провайдера по приоритету
+
+                # 1. Пробуем использовать Gemini API (высший приоритет)
+                if self._gemini_available and self.gemini_handler:
+                    try:
+                        logger.info(f"Начало генерации контента типа {content_type.value} с использованием Gemini API")
+
+                        # Получаем сгенерированный контент через Gemini API
+                        generated_content = await self.gemini_handler.generate_content(
+                            prompt=prompt,
+                            temperature=0.7,
+                            max_tokens=2048
+                        )
+
+                        if generated_content:
+                            logger.info(f"Контент успешно сгенерирован через Gemini API, длина: {len(generated_content)}")
+                            return generated_content
+                        else:
+                            logger.warning("Gemini API вернул пустой ответ, переключаемся на Mistral")
+                    except Exception as e:
+                        logger.error(f"Ошибка при генерации через Gemini API: {str(e)}")
+                        logger.info("Переключаемся на Mistral API")
+
+                # 2. Пробуем использовать OpenRouter API (высокий приоритет)
+                if self._openrouter_available and self.openrouter_handler:
+                    try:
+                        logger.info(f"Начало генерации контента типа {content_type.value} с использованием OpenRouter API")
+
+                        # Получаем сгенерированный контент через OpenRouter API
+                        generated_content = await self.openrouter_handler.generate_content(
+                            prompt=prompt,
+                            temperature=0.7,
+                            max_tokens=2048
+                        )
+
+                        if generated_content:
+                            logger.info(f"Контент успешно сгенерирован через OpenRouter API, длина: {len(generated_content)}")
+                            return generated_content
+                        else:
+                            logger.warning("OpenRouter API вернул пустой ответ, переключаемся на Groq")
+                    except Exception as e:
+                        logger.error(f"Ошибка при генерации через OpenRouter API: {str(e)}")
+                        logger.info("Переключаемся на Groq")
+
+                # 3. Пробуем использовать Groq через прокси (высокий приоритет)
+                # Сначала пробуем прямой Groq API (если доступен)
+                if self._groq_available and self.groq_handler:
+                    try:
+                        logger.info(f"Начало генерации контента типа {content_type.value} с использованием Groq API (прямой)")
+
+                        # Получаем сгенерированный контент через прямой Groq API
+                        generated_content = await self.groq_handler.generate_content(
+                            prompt=prompt,
+                            temperature=0.7,
+                            max_tokens=2048
+                        )
+
+                        if generated_content:
+                            logger.info(f"Контент успешно сгенерирован через прямой Groq API, длина: {len(generated_content)}")
+                            return generated_content
+                        else:
+                            logger.warning("Прямой Groq API вернул пустой ответ, пробуем Groq прокси")
+                    except Exception as e:
+                        logger.error(f"Ошибка при генерации через прямой Groq API: {str(e)}")
+                        logger.info("Переключаемся на Groq прокси")
+
+                # Пробуем Groq через прокси (если прямой API не сработал)
+                try:
+                    from ...utils.groq_proxy_handler import GroqProxyHandler, GROQ_PROXY_AVAILABLE
+                    from ...utils.component_mapping import get_groq_component_id
+
+                    if GROQ_PROXY_AVAILABLE:
+                        # Определяем component_id для Groq на основе типа контента
+                        groq_component_id = get_groq_component_id(content_type)
+
+                        logger.info(f"Начало генерации контента типа {content_type.value} с использованием Groq прокси ({groq_component_id})")
+
+                        # Создаем обработчик Groq прокси
+                        groq_proxy_handler = GroqProxyHandler(component_id=groq_component_id)
+
+                        if groq_proxy_handler.is_available():
+                            # Получаем сгенерированный контент через Groq прокси
+                            generated_content = await groq_proxy_handler.generate_content(
+                                prompt=prompt,
+                                temperature=0.7,
+                                max_tokens=2048
+                            )
+
+                            if generated_content:
+                                logger.info(f"Контент успешно сгенерирован через Groq прокси ({groq_component_id}), длина: {len(generated_content)}")
+                                return generated_content
+                            else:
+                                logger.warning("Groq прокси вернул пустой ответ, переключаемся на Mistral")
+                        else:
+                            logger.warning("Groq прокси недоступен, переключаемся на Mistral")
+                    else:
+                        logger.info("Groq прокси не настроен, переключаемся на Mistral")
+                except Exception as e:
+                    logger.error(f"Ошибка при генерации через Groq прокси: {str(e)}")
+                    logger.info("Переключаемся на Mistral")
+
+                # 4. Пробуем использовать Mistral API (средний приоритет)
+                if self._mistral_available and self.mistral_handler:
+                    try:
+                        logger.info(f"Начало генерации контента типа {content_type.value} с использованием Mistral API")
+
+                        # Получаем сгенерированный контент через Mistral API
+                        generated_content = await self.mistral_handler.generate_content(
+                            prompt=prompt,
+                            temperature=0.7,
+                            max_tokens=2048
+                        )
+
+                        if generated_content:
+                            logger.info(f"Контент успешно сгенерирован через Mistral API, длина: {len(generated_content)}")
+                            return generated_content
+                        else:
+                            logger.warning("Mistral API вернул пустой ответ, переключаемся на G4F")
+                    except Exception as e:
+                        logger.error(f"Ошибка при генерации через Mistral API: {str(e)}")
+                        logger.info("Переключаемся на G4F")
+
+                # 4. Используем G4F (низший приоритет)
+                if self._g4f_available and self.g4f_handler:
+                    logger.info(f"Начало генерации контента типа {content_type.value} с использованием G4F")
+
+                    # Получаем модель и провайдер для генерации
+                    model_info = await self.g4f_handler.get_available_model()
+                    if not model_info:
+                        logger.error("Не удалось получить доступную модель для генерации контента через G4F")
+                        return "Не удалось сгенерировать ответ. Пожалуйста, попробуйте еще раз или выберите другую модель."
+
+                    model, provider = model_info
+                    logger.info(f"Используем модель G4F {model} (провайдер: {provider.__name__ if hasattr(provider, '__name__') else provider})")
+
+                    # Получаем сгенерированный контент через G4F
+                    generated_content = await self.g4f_handler.generate_content(
+                        prompt=prompt,
+                        model=model,
+                        provider=provider
+                    )
+
+                    logger.info(f"Контент успешно сгенерирован через G4F, длина: {len(generated_content) if generated_content else 0}")
+
+                    if generated_content:
+                        return generated_content
+
+                logger.error("Все провайдеры генерации контента недоступны или вернули ошибки")
+                return "Не удалось сгенерировать ответ. Пожалуйста, попробуйте еще раз позже."
+
+        except Exception as e:
+            logger.error(f"Критическая ошибка при генерации контента: {str(e)}")
+            import traceback
+            logger.error(f"Трассировка: {traceback.format_exc()}")
+            return "Не удалось сгенерировать ответ из-за технической ошибки. Пожалуйста, попробуйте еще раз позже."
+
+    async def _generate_with_queue(
+            self,
+            user_id: int,
+            prompt: str,
+            content_type: ContentType
+    ) -> Optional[str]:
+        """
+        Fallback метод для генерации контента через очередь
+
+        Args:
+            user_id: ID пользователя
+            prompt: Текст промпта для генерации
+            content_type: Тип контента
+
+        Returns:
+            Optional[str]: Сгенерированный текст или None в случае ошибки
+        """
+        try:
+            # Получаем приоритет пользователя
+            user_priority = 0
+            if self.session is not None:
+                try:
+                    user_priority = await self._get_user_priority(user_id)
+                except Exception as e:
+                    logger.error(f"Ошибка при получении приоритета пользователя: {str(e)}")
+
+            # Инициализируем очередь
+            queue = None
+            try:
+                queue = await self.get_generation_queue()
+            except Exception as e:
+                logger.error(f"Ошибка при получении очереди генерации: {str(e)}")
+                return None
+
+            if queue is None:
+                logger.error("Очередь генерации равна None")
+                return None
+
+            # Добавляем задачу в очередь с приоритетом
+            task_id = await queue.add_to_queue(
+                user_id=user_id,
+                content_type=content_type.value,
+                prompt=prompt,
+                priority=user_priority
+            )
+
+            # Ожидаем завершения генерации с таймаутом
+            timeout = 60  # 1 минута
+            start_time = datetime.utcnow()
+
+            while True:
+                status = await queue.get_status(task_id)
+                if status['status'] == 'completed':
+                    return status['result']
+                elif status['status'] == 'error':
+                    error_message = status.get('error', 'Неизвестная ошибка')
+                    logger.error(f"Ошибка при генерации контента через очередь: {error_message}")
+                    return None
+
+                # Проверяем таймаут
+                if (datetime.utcnow() - start_time).total_seconds() > timeout:
+                    logger.error(f"Превышено время ожидания генерации через очередь ({timeout} секунд)")
+                    return None
+
+                # Небольшая пауза перед следующей проверкой
+                await asyncio.sleep(1)
+
+        except Exception as e:
+            logger.error(f"Ошибка при генерации контента через очередь: {str(e)}")
+            return None
+
+    async def get_g4f_status(self):
+        """
+        Получить текущий статус всех провайдеров генерации
+
+        Returns:
+            Dict: Статус доступности и информация о провайдерах
+        """
+        try:
+            # Проверяем доступность провайдеров
+            await self.ensure_g4f_handler()
+
+            # Проверяем доступность Groq прокси
+            groq_proxy_available = False
+            try:
+                from ...utils.groq_proxy_handler import GROQ_PROXY_AVAILABLE
+                groq_proxy_available = GROQ_PROXY_AVAILABLE
+            except ImportError:
+                pass
+
+            # Собираем информацию о всех провайдерах
+            openrouter_available = getattr(self, '_openrouter_available', False)
+            groq_direct_available = getattr(self, '_groq_available', False)
+
+            status = {
+                "available": self._gemini_available or openrouter_available or groq_direct_available or groq_proxy_available or self._mistral_available or self._g4f_available,
+                "providers": {
+                    "gemini": {
+                        "available": self._gemini_available,
+                        "model": "gemini-2.0-flash" if self._gemini_available else None,
+                        "type": "direct_api"
+                    },
+                    "openrouter": {
+                        "available": openrouter_available,
+                        "model": "google/gemini-2.0-flash-exp:free" if openrouter_available else None,
+                        "type": "direct_api"
+                    },
+                    "groq_direct": {
+                        "available": groq_direct_available,
+                        "model": "meta-llama/llama-4-maverick-17b-128e-instruct" if groq_direct_available else None,
+                        "type": "direct_api"
+                    },
+                    "groq_proxy": {
+                        "available": groq_proxy_available,
+                        "model": "meta-llama/llama-4-maverick-17b-128e-instruct" if groq_proxy_available else None,
+                        "type": "cloudflare_proxy"
+                    },
+                    "mistral": {
+                        "available": self._mistral_available,
+                        "model": "open-mistral-nemo" if self._mistral_available else None,
+                        "type": "direct_api"
+                    },
+                    "g4f": {
+                        "available": self._g4f_available,
+                        "type": "fallback"
+                    }
+                }
+            }
+
+            # Получаем информацию о модели G4F если доступна
+            if self._g4f_available and self.g4f_handler:
+                try:
+                    model_info = await self.g4f_handler.get_available_model()
+                    if model_info:
+                        model, provider = model_info
+                        status["providers"]["g4f"]["model"] = str(model)
+                        status["providers"]["g4f"]["provider"] = provider.__name__ if hasattr(provider, '__name__') else str(provider)
+                except Exception as e:
+                    logger.error(f"Ошибка при получении информации о модели G4F: {e}")
+                    status["providers"]["g4f"]["error"] = str(e)
+
+            return status
+
+        except Exception as e:
+            logger.error(f"Ошибка при получении статуса провайдеров: {e}")
+            return {
+                "available": False,
+                "error": str(e)
+            }
+
+    def set_generation_timeout(self, timeout: int):
+        """
+        Установить таймаут для генерации контента
+
+        Args:
+            timeout: Таймаут в секундах
+        """
+        if hasattr(self, 'g4f_handler'):
+            self.g4f_handler.set_timeout(timeout)
+            logger.info(f"Установлен таймаут генерации контента: {timeout} секунд")
+
+    async def clear_content_cache(self, content_type: Optional[ContentType] = None):
+        """
+        Очистить кэш сгенерированного контента
+
+        Args:
+            content_type: Тип контента для очистки или None для очистки всего кэша
+        """
+        try:
+            if content_type:
+                # Очищаем кэш для конкретного типа контента
+                pattern = f"*{content_type.value}*"
+                deleted = await self.cache_service.invalidate_pattern(pattern)
+                logger.info(f"Очищено {deleted} записей кэша для типа контента {content_type.value}")
+            else:
+                # Очищаем весь кэш контента
+                deleted = await self.cache_service.invalidate_pattern("*")
+                logger.info(f"Очищено {deleted} записей кэша контента")
+
+            return deleted
+        except Exception as e:
+            logger.error(f"Ошибка при очистке кэша контента: {str(e)}")
+            raise
+
+    # Context manager methods
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.session.close()
+
+    async def refresh_g4f_handler(self) -> bool:
+        """Обновляем провайдеры генерации и проверяем их доступность"""
+        try:
+            # Получаем API ключи из переменных окружения
+            mistral_api_key = os.environ.get("MISTRAL_API_KEY")
+            gemini_api_key = os.environ.get("GEMINI_API_KEY")
+
+            # Обновляем Gemini API если доступен ключ
+            if gemini_api_key:
+                try:
+                    from ...utils.gemini_api import GeminiHandler, GEMINI_AVAILABLE
+                    if GEMINI_AVAILABLE:
+                        self.gemini_handler = GeminiHandler(api_key=gemini_api_key)
+                        self._gemini_available = self.gemini_handler.is_available()
+                        logger.info(f"GeminiHandler переинициализирован и доступен: {self._gemini_available}")
+                    else:
+                        logger.warning("Библиотека Google Generative AI не установлена")
+                        self._gemini_available = False
+                except Exception as e:
+                    logger.error(f"Ошибка при переинициализации GeminiHandler: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+                    self._gemini_available = False
+            else:
+                logger.warning("API ключ Google Gemini не найден в переменных окружения")
+                self._gemini_available = False
+
+            # Обновляем Mistral API если доступен ключ
+            if mistral_api_key:
+                try:
+                    from ...utils.mistral_api import MistralHandler, MISTRAL_AVAILABLE
+                    if MISTRAL_AVAILABLE:
+                        self.mistral_handler = MistralHandler(api_key=mistral_api_key)
+                        self._mistral_available = self.mistral_handler.is_available()
+                        logger.info(f"MistralHandler переинициализирован и доступен: {self._mistral_available}")
+                    else:
+                        logger.warning("Библиотека Mistral не установлена")
+                        self._mistral_available = False
+                except Exception as e:
+                    logger.error(f"Ошибка при переинициализации MistralHandler: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+                    self._mistral_available = False
+            else:
+                logger.warning("API ключ Mistral не найден в переменных окружения")
+                self._mistral_available = False
+
+            # Обновляем G4F
+            try:
+                from ...utils.g4f_handler import G4FHandler, G4F_AVAILABLE
+                if G4F_AVAILABLE:
+                    self.g4f_handler = G4FHandler(
+                        api_key=mistral_api_key,
+                        openrouter_api_key=openrouter_api_key,
+                        llm7_api_key=llm7_api_key,
+                        gemini_handler=self.gemini_handler if self._gemini_available else None,
+                        groq_handler=self.groq_handler if self._groq_available else None,
+                        together_handler=self.together_handler if self._together_available else None,
+                        cerebras_handler=self.cerebras_handler if self._cerebras_available else None,
+                        chutes_handler=self.chutes_handler if self._chutes_available else None
+                    )
+                    self._g4f_available = True
+                    logger.info("G4FHandler переинициализирован")
+                else:
+                    logger.warning("G4F не установлен, этот провайдер будет недоступен")
+                    self._g4f_available = False
+            except Exception as e:
+                logger.error(f"Ошибка при переинициализации G4FHandler: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+                self._g4f_available = False
+
+            # Возвращаем True, если хотя бы один провайдер доступен
+            providers_available = self._gemini_available or self._mistral_available or self._g4f_available
+            logger.info(f"Переинициализация провайдеров завершена (доступно: {providers_available})")
+            return providers_available
+
+        except Exception as e:
+            logger.error(f"Ошибка при переинициализации провайдеров: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
+
+    @memory_optimized()
+    async def generate_questions(
+        self,
+        text: str,
+        language: str,
+        num_questions: int = 5,
+        vocabulary: str = None,
+        grammar: str = None,
+        **kwargs
+    ) -> QuestionsAnalysis:
+        """Генерирует вопросы к тексту"""
+        try:
+            # Проверяем параметры
+            params = {
+                "text": text,
+                "language": language,
+                "num_questions": num_questions,
+                "vocabulary": vocabulary,
+                "grammar": grammar,
+                **kwargs
+            }
+            self._validate_question_params(params)
+
+            # Создаем промпт
+            prompt = self._create_questions_prompt(params, text, vocabulary, grammar)
+
+            # Генерируем контент
+            content = await self.generate_content(
+                user_id=params.get("user_id", 0),
+                prompt=prompt,
+                content_type=ContentType.TEXT_ANALYSIS,
+                use_cache=not params.get("force", False)
+            )
+
+            # Парсим и структурируем вопросы
+            questions = self._structure_questions(content)
+
+            # Создаем объект с результатами
+            return QuestionsAnalysis(questions=questions)
+
+        except Exception as e:
+            logger.error(f"Error generating questions: {str(e)}")
+            raise
+
+    def _validate_question_params(self, params: Dict[str, Any]) -> None:
+        """
+        Проверяет параметры для генерации вопросов.
+
+        Args:
+            params: Параметры для генерации вопросов
+        """
+        if not params.get("language"):
+            raise ValueError("Missing required parameter: language")
+
+        if not params.get("text"):
+            raise ValueError("Missing required parameter: text")
+
+        if not params.get("num_questions"):
+            raise ValueError("Missing required parameter: num_questions")
+
+        if not 1 <= params.get('num_questions', 0) <= 20:
+            raise ValueError("Number of questions must be between 1 and 20")
+
+    def _create_questions_prompt(self, params: Dict[str, Any], text: str, vocabulary: str = None, grammar: str = None) -> str:
+        """
+        Создает промпт для генерации вопросов.
+
+        Args:
+            params: Параметры для генерации вопросов
+            text: Текст для генерации вопросов
+            vocabulary: Дополнительный словарный запас
+            grammar: Дополнительная грамматика
+
+        Returns:
+            str: Промпт для генерации вопросов
+        """
+        language = params.get("language", "english")
+        difficulty = params.get("difficulty", "medium")
+        num_questions = params.get("num_questions", 5)
+
+        # Обрезаем текст, если он слишком длинный
+        max_text_length = 4000
+        if len(text) > max_text_length:
+            text = text[:max_text_length]
+
+        prompt = f"""You are a professional language teacher and expert in {language}.
+I will provide you with a text in {language}, and I need you to create {num_questions} questions about this text.
+
+The questions should be at {difficulty} difficulty level.
+"""
+
+        if vocabulary:
+            prompt += f"\nFocus on vocabulary related to: {vocabulary}.\n"
+
+        if grammar:
+            prompt += f"\nFocus on grammar topics related to: {grammar}.\n"
+
+        prompt += f"""
+Create {num_questions} comprehension questions based on the text below.
+For each question, provide multiple-choice options (A, B, C, D) and indicate the correct answer.
+
+TEXT:
+```
+{text}
+```
+
+Each question should:
+1. Be clear and directly related to the text
+2. Have exactly 4 options (A, B, C, D)
+3. Have only one correct answer
+4. Be at {difficulty} difficulty level
+
+Format your response as a structured JSON array with the following format:
+```json
+[
+  {{
+    "number": 1,
+    "question": "Question text here?",
+    "options": [
+      "Option A text",
+      "Option B text",
+      "Option C text",
+      "Option D text"
+    ],
+    "answer": "A. Option A text"
+  }},
+  // More questions...
+]
+```
+
+Ensure your response is valid JSON that can be parsed. Don't include any explanations outside the JSON structure.
+"""
+
+        return prompt
+
+    def _structure_questions(self, content: str) -> List[Dict[str, Any]]:
+        """
+        Разбирает сгенерированный контент с вопросами и преобразует его в структурированный список.
+
+        Args:
+            content: Сгенерированный текст с вопросами
+
+        Returns:
+            List[Dict[str, Any]]: Список словарей с вопросами и ответами
+        """
+        questions = []
+
+        try:
+            # Пытаемся найти и распарсить JSON в тексте
+            json_match = re.search(r'```json\s*(\[.*?\])\s*```', content, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(1)
+                return json.loads(json_str)
+
+            # Пытаемся найти JSON-массив в тексте
+            json_match = re.search(r'\[\s*{\s*"number".*?}\s*\]', content, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(0)
+                return json.loads(json_str)
+
+            # Если не нашли JSON в тексте, пробуем распарсить весь текст как JSON
+            try:
+                json_data = json.loads(content)
+                if isinstance(json_data, list) and len(json_data) > 0:
+                    return json_data
+            except:
+                pass
+
+            # Если не удалось распарсить как JSON, используем регулярные выражения
+
+            # Попробуем разные шаблоны для нахождения вопросов
+            patterns = [
+                # Формат "Question 1:" или "Вопрос 1:"
+                r'(?:Question|Вопрос)\s+(\d+)[:\.]',
+                # Формат "## Question 1" или "## Вопрос 1"
+                r'#{2,3}\s*(?:Question|Вопрос)\s+(\d+)[:\.]?',
+                # Формат "1. Question" или "1. Вопрос"
+                r'(\d+)[\.:\)]\s+(?:[A-Z]|[А-Я])',
+                # Формат "Exercise 1:" или "Упражнение 1:"
+                r'(?:Exercise|Упражнение)\s+(\d+)[:\.]'
+            ]
+
+            # Пробуем каждый шаблон по очереди
+            question_blocks = []
+            for pattern in patterns:
+                question_blocks = re.split(pattern, content)
+                # Если нашли хотя бы один вопрос, прерываем поиск
+                if len(question_blocks) > 2:
+                    break
+
+            if len(question_blocks) <= 1:
+                # Если не нашли вопросы по шаблонам, попробуем просто разбить по строкам
+                # и искать строки, начинающиеся с цифр
+                lines = content.split('\n')
+                current_question = None
+                current_options = []
+                current_block = ""
+
+                for line in lines:
+                    if re.match(r'^\d+\.?\s+', line):
+                        # Если нашли новый вопрос, сохраняем предыдущий
+                        if current_question:
+                            questions.append({
+                                "number": len(questions) + 1,
+                                "question": current_question,
+                                "options": current_options,
+                                "answer": None  # Ответ определим позже
+                            })
+                        # Начинаем новый вопрос
+                        current_question = re.sub(r'^\d+\.?\s+', '', line).strip()
+                        current_options = []
+                        current_block = line + "\n"
+                    elif re.match(r'^[A-D]\.?\s+', line) and current_question:
+                        # Нашли вариант ответа
+                        option_text = re.sub(r'^[A-D]\.?\s+', '', line).strip()
+                        current_options.append(option_text)
+                        current_block += line + "\n"
+                    elif current_question:
+                        # Продолжение текущего вопроса или блока
+                        current_block += line + "\n"
+
+                        # Проверяем, не ответ ли это
+                        if re.search(r'(?:Answer|Правильный ответ)[:\s]+([^\n\r]+)', line):
+                            answer_match = re.search(r'(?:Answer|Правильный ответ)[:\s]+([^\n\r]+)', line)
+                            if answer_match:
+                                questions[-1]["answer"] = answer_match.group(1).strip()
+
+                # Добавляем последний вопрос, если он есть
+                if current_question:
+                    questions.append({
+                        "number": len(questions) + 1,
+                        "question": current_question,
+                        "options": current_options,
+                        "answer": None
+                    })
+
+                # Проверяем на наличие ответов
+                for i, q in enumerate(questions):
+                    if not q["answer"]:
+                        # Пытаемся найти ответ в блоке текста
+                        answer_pattern = re.search(r'(?:Answer|Правильный ответ)[:\s]+([^\n\r]+)', current_block)
+                        if answer_pattern:
+                            questions[i]["answer"] = answer_pattern.group(1).strip()
+
+                return questions
+            else:
+                # Обрабатываем найденные блоки вопросов
+                question_number = 1
+                for i in range(1, len(question_blocks), 2):
+                    if i + 1 >= len(question_blocks):
+                        break
+
+                    number = int(question_blocks[i])
+                    block = question_blocks[i + 1].strip()
+
+                    # Извлекаем текст вопроса
+                    question_lines = block.split('\n')
+                    question_text = ""
+
+                    # Находим текст вопроса до вариантов ответов
+                    for line in question_lines:
+                        if re.match(r'^[A-D]\.', line.strip()) or "Options" in line or "Варианты ответов" in line:
+                            break
+                        question_text += line + " "
+
+                    question_text = question_text.strip()
+                    question_text = re.sub(r'^[:\s]+', '', question_text)
+
+                    # Извлекаем варианты ответов
+                    options = []
+                    options_pattern = r'(?:[A-D])[\.\:\)\s]+([^\n]+)'
+                    option_matches = re.findall(options_pattern, block)
+
+                    if option_matches:
+                        options = [opt.strip() for opt in option_matches]
+                    else:
+                        # Альтернативный поиск вариантов ответов
+                        options_section = re.search(r'(?:Options|Варианты ответов)[:\s]+(.*?)(?:(?:Correct )?Answer|Правильный ответ|$)', block, re.DOTALL)
+                        if options_section:
+                            options_text = options_section.group(1).strip()
+                            option_lines = re.findall(r'([A-D])[\.:\)\s]+([^\n\r]+)', options_text)
+                            options = [opt[1].strip() for opt in option_lines]
+
+                    # Извлекаем правильный ответ
+                    answer = None
+                    answer_match = re.search(r'(?:Answer|Правильный ответ)[:\s]+([^\n\r]+)', block, re.DOTALL)
+
+                    if answer_match:
+                        answer = answer_match.group(1).strip()
+
+                    if question_text:
+                        questions.append({
+                            "number": number,
+                            "question": question_text,
+                            "options": options,
+                            "answer": answer
+                        })
+                        question_number += 1
+
+                # Если ничего не нашли, возвращаем пустой список
+                return questions if questions else []
+
+        except Exception as e:
+            logger.error(f"Error structuring questions: {str(e)}")
+            return []
+
+    async def process_video_transcript(self, video_id: str, subtitle_language: str = "ru") -> str:
+        """Process video transcript for language learning"""
+        from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound
+        import re
+
+        logger.info(f"Обработка транскрипта для видео {video_id}")
+
+        # Extract YouTube ID from URL if a full URL was provided
+        video_id = self._extract_video_id(video_id)
+        if not video_id:
+            logger.error("Invalid YouTube video ID")
+            raise ValueError("Invalid YouTube video ID format")
+
+        # Check cache first without starting a new transaction
+        stmt = select(VideoTranscript).where(
+            VideoTranscript.video_id == video_id,
+            VideoTranscript.language == subtitle_language
+        )
+
+        result = await self.session.execute(stmt)
+        cached_transcript = result.scalar_one_or_none()
+
+        if cached_transcript:
+            logger.info(f"Found cached transcript for video {video_id} in {subtitle_language}")
+            return cached_transcript.content
+
+        # If not cached, fetch from YouTube
+        try:
+            logger.info(f"Fetching transcript for video {video_id} in {subtitle_language}")
+            transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=[subtitle_language])
+
+            # Combine transcript entries into a single text
+            transcript_text = ' '.join([entry['text'] for entry in transcript_list])
+
+            # Save to database
+            video_transcript = VideoTranscript(
+                video_id=video_id,
+                language=subtitle_language,
+                content=transcript_text,
+                created_at=datetime.utcnow()
+            )
+            self.session.add(video_transcript)
+            await self.session.flush()
+
+            logger.info(f"Successfully fetched and cached transcript for video {video_id}")
+            return transcript_text
+
+        except Exception as e:
+            logger.error(f"Error fetching YouTube transcript: {str(e)}")
+            raise ValidationError(f"Could not fetch transcript for video {video_id}: {str(e)}")
+
+from typing import Optional, Dict, Any, List, Union
+import logging
+from datetime import datetime, timedelta
+import asyncio
+import time
+import re
+import hashlib
+import json
+import os
+
+from ...models import Generation, User, Course, Lesson, Image, VideoTranscript
+from ...core.exceptions import ValidationError
+from ...core.constants import ContentType
+from ...services.optimization.query_optimizer import QueryOptimizer
+from ...services.optimization.batch_processor import BatchProcessor
+from ...core.cache import CacheService
+from ...core.memory import memory_optimized
+from ...utils.g4f_handler import G4FHandler, G4F_AVAILABLE
+from ...utils.mistral_api import MistralHandler, MISTRAL_AVAILABLE
+try:
+    from ...utils.gemini_api import GeminiHandler, GEMINI_AVAILABLE
+except ImportError:
+    GEMINI_AVAILABLE = False
+from youtube_transcript_api import YouTubeTranscriptApi
+from ...schemas.content import TextLevelAnalysis, TitlesAnalysis, QuestionsAnalysis
+from fastapi import Request
+
+logger = logging.getLogger(__name__)
+
+
+class ContentGenerator:
+    def __init__(self, session: AsyncSession):
+        self.session = session
+        self.query_optimizer = QueryOptimizer(session)
+        self.cache_service = CacheService()
+        self.batch_processor = BatchProcessor(session)
+        # Initialize queue to None - we'll create it when needed
+        self._generation_queue = None
+
+        # Получаем API ключи из переменных окружения
+        mistral_api_key = os.environ.get("MISTRAL_API_KEY")
+        gemini_api_key = os.environ.get("GEMINI_API_KEY")
+        groq_api_key = os.environ.get("GROQ_API_KEY") or os.environ.get("GROQ_API_KEY_TEST")
+        openrouter_api_key = os.environ.get("OPENROUTER_API_KEY")
+        llm7_api_key = os.environ.get("LLM7_API_KEY")
+        together_api_key = os.environ.get("TOGETHER_API_KEY_1")  # Используем первый ключ
+        cerebras_api_key = os.environ.get("CEREBRAS_API_KEY_1")  # Используем первый ключ
+        chutes_api_key = os.environ.get("CHUTES_API_KEY_1")     # Используем первый ключ
+
+        # Инициализируем обработчики API для разных провайдеров
+        self.mistral_handler = None
+        self.gemini_handler = None
+        self.groq_handler = None
+        self.openrouter_handler = None
+        self.llm7_handler = None
+        self.together_handler = None
+        self.cerebras_handler = None
+        self.chutes_handler = None
+        self.g4f_handler = None
+
+        # Флаги доступности провайдеров
+        self._mistral_available = False
+        self._gemini_available = False
+        self._groq_available = False
+        self._openrouter_available = False
+        self._llm7_available = False
+        self._together_available = False
+        self._cerebras_available = False
+        self._chutes_available = False
+        self._g4f_available = False
+
+        # Инициализируем Gemini API если доступен ключ
+        if gemini_api_key:
+            try:
+                from ...utils.gemini_api import GeminiHandler, GEMINI_AVAILABLE
+                if GEMINI_AVAILABLE:
+                    self.gemini_handler = GeminiHandler(api_key=gemini_api_key)
+                    self._gemini_available = self.gemini_handler.is_available()
+                    logger.info(f"GeminiHandler инициализирован и доступен: {self._gemini_available}")
+                else:
+                    logger.warning("Библиотека Google Generative AI не установлена")
+            except Exception as e:
+                logger.error(f"Ошибка при инициализации GeminiHandler: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+        else:
+            logger.warning("API ключ Google Gemini не найден в переменных окружения")
+
+        # Инициализируем Mistral API если доступен ключ
+        if mistral_api_key:
+            try:
+                from ...utils.mistral_api import MistralHandler, MISTRAL_AVAILABLE
+                if MISTRAL_AVAILABLE:
+                    self.mistral_handler = MistralHandler(api_key=mistral_api_key)
+                    self._mistral_available = self.mistral_handler.is_available()
+                    logger.info(f"MistralHandler инициализирован и доступен: {self._mistral_available}")
+                else:
+                    logger.warning("Библиотека Mistral не установлена")
+            except Exception as e:
+                logger.error(f"Ошибка при инициализации MistralHandler: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+        else:
+            logger.warning("API ключ Mistral не найден в переменных окружения")
+
+        # Инициализируем Groq API если доступен ключ
+        if groq_api_key:
+            try:
+                from ...utils.groq_api import GroqHandler, GROQ_AVAILABLE
+                if GROQ_AVAILABLE:
+                    self.groq_handler = GroqHandler(api_key=groq_api_key)
+                    self._groq_available = self.groq_handler.is_available()
+                    logger.info(f"GroqHandler инициализирован и доступен: {self._groq_available}")
+                else:
+                    logger.warning("Библиотека Groq не установлена")
+            except Exception as e:
+                logger.error(f"Ошибка при инициализации GroqHandler: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+        else:
+            logger.warning("API ключ Groq не найден в переменных окружения")
+
+        # Инициализируем OpenRouter API если доступен ключ
+        if openrouter_api_key:
+            try:
+                from ...utils.openrouter_api import OpenRouterHandler, OPENROUTER_AVAILABLE
+                if OPENROUTER_AVAILABLE:
+                    self.openrouter_handler = OpenRouterHandler(api_key=openrouter_api_key)
+                    self._openrouter_available = self.openrouter_handler.is_available()
+                    logger.info(f"OpenRouterHandler инициализирован и доступен: {self._openrouter_available}")
+                else:
+                    logger.warning("Библиотека OpenRouter не установлена")
+            except Exception as e:
+                logger.error(f"Ошибка при инициализации OpenRouterHandler: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+        else:
+            logger.warning("API ключ OpenRouter не найден в переменных окружения")
+
+        # Инициализируем Together AI API если доступен ключ
+        if together_api_key:
+            try:
+                from ...utils.together_api import TogetherHandler, TOGETHER_AVAILABLE
+                if TOGETHER_AVAILABLE:
+                    self.together_handler = TogetherHandler(api_key=together_api_key)
+                    self._together_available = self.together_handler.is_available()
+                    logger.info(f"TogetherHandler инициализирован и доступен: {self._together_available}")
+                else:
+                    logger.warning("Библиотека Together AI не установлена")
+            except Exception as e:
+                logger.error(f"Ошибка при инициализации TogetherHandler: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+        else:
+            logger.warning("API ключ Together AI не найден в переменных окружения")
+
+        # Инициализируем Cerebras API если доступен ключ
+        if cerebras_api_key:
+            try:
+                from ...utils.cerebras_api import CerebrasHandler, CEREBRAS_AVAILABLE
+                if CEREBRAS_AVAILABLE:
+                    self.cerebras_handler = CerebrasHandler(api_key=cerebras_api_key)
+                    self._cerebras_available = self.cerebras_handler.is_available()
+                    logger.info(f"CerebrasHandler инициализирован и доступен: {self._cerebras_available}")
+                else:
+                    logger.warning("Библиотека Cerebras не установлена")
+            except Exception as e:
+                logger.error(f"Ошибка при инициализации CerebrasHandler: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+        else:
+            logger.warning("API ключ Cerebras не найден в переменных окружения")
+
+        # Инициализируем Chutes AI API если доступен ключ
+        if chutes_api_key:
+            try:
+                from ...utils.chutes_api import ChutesHandler, CHUTES_AVAILABLE
+                if CHUTES_AVAILABLE:
+                    self.chutes_handler = ChutesHandler(api_key=chutes_api_key)
+                    self._chutes_available = self.chutes_handler.is_available()
+                    logger.info(f"ChutesHandler инициализирован и доступен: {self._chutes_available}")
+                else:
+                    logger.warning("Библиотека Chutes AI не установлена")
+            except Exception as e:
+                logger.error(f"Ошибка при инициализации ChutesHandler: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+        else:
+            logger.warning("API ключ Chutes AI не найден в переменных окружения")
+
+        # Инициализируем LLM7 API если доступен ключ
+        if llm7_api_key:
+            try:
+                from ...utils.llm7_api import LLM7Handler, LLM7_AVAILABLE
+                if LLM7_AVAILABLE:
+                    self.llm7_handler = LLM7Handler(api_key=llm7_api_key)
+                    self._llm7_available = self.llm7_handler.is_available()
+                    logger.info(f"LLM7Handler инициализирован и доступен: {self._llm7_available}")
+                else:
+                    logger.warning("Библиотека LLM7 не установлена")
+            except Exception as e:
+                logger.error(f"Ошибка при инициализации LLM7Handler: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+        else:
+            logger.warning("API ключ LLM7 не найден в переменных окружения")
+
+        # Инициализируем G4F как запасной вариант
+        try:
+            from ...utils.g4f_handler import G4FHandler, G4F_AVAILABLE
+            if G4F_AVAILABLE:
+                self.g4f_handler = G4FHandler(
+                    api_key=mistral_api_key,
+                    openrouter_api_key=openrouter_api_key,
+                    llm7_api_key=llm7_api_key,
+                    gemini_handler=self.gemini_handler if self._gemini_available else None,
+                    groq_handler=self.groq_handler if self._groq_available else None,
+                    together_handler=self.together_handler if self._together_available else None,
+                    cerebras_handler=self.cerebras_handler if self._cerebras_available else None,
+                    chutes_handler=self.chutes_handler if self._chutes_available else None
+                )
+                self._g4f_available = True
+                logger.info("G4FHandler инициализирован")
+            else:
+                logger.warning("G4F не установлен, этот провайдер будет недоступен")
+        except Exception as e:
+            logger.error(f"Ошибка при инициализации G4FHandler: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+
+        # Логируем информацию о доступных провайдерах
+        available_providers = []
+        if self._gemini_available:
+            available_providers.append("Gemini")
+        if self._openrouter_available:
+            available_providers.append("OpenRouter")
+        if self._groq_available:
+            available_providers.append("Groq")
+        if self._llm7_available:
+            available_providers.append("LLM7")
+        if self._together_available:
+            available_providers.append("Together AI")
+        if self._cerebras_available:
+            available_providers.append("Cerebras")
+        if self._chutes_available:
+            available_providers.append("Chutes AI")
+        if self._mistral_available:
+            available_providers.append("Mistral")
+        if self._g4f_available:
+            available_providers.append("G4F")
+
+        logger.info(f"ContentGenerator инициализирован с {len(available_providers)} провайдерами: {', '.join(available_providers)}")
+
+    async def ensure_g4f_handler(self) -> bool:
+        """Проверяем и обеспечиваем доступность провайдеров генерации"""
+        # Если ни один провайдер не доступен, пробуем переинициализировать
+        if not any([
+            self._gemini_available, self._openrouter_available, self._groq_available,
+            self._llm7_available, self._together_available, self._cerebras_available,
+            self._chutes_available, self._mistral_available, self._g4f_available
+        ]):
+            logger.info("Ни один провайдер генерации не доступен, пробуем переинициализировать")
+            return await self.refresh_g4f_handler()
+
+        # Если хотя бы один провайдер доступен, возвращаем True
+        return any([
+            self._gemini_available, self._openrouter_available, self._groq_available,
+            self._llm7_available, self._together_available, self._cerebras_available,
+            self._chutes_available, self._mistral_available, self._g4f_available
+        ])
+
+    async def get_generation_queue(self):
+        """Lazy initialization of generation queue"""
+        if self._generation_queue is None:
+            # Import here to avoid circular import
+            from ...services.queue.generation_queue import AsyncGenerationQueue
+            self._generation_queue = AsyncGenerationQueue(self.session)
+            await self._generation_queue.initialize()
+        return self._generation_queue
+
+    async def generate_content(
+        self,
+        user_id: int,
+        prompt: str,
+        content_type: ContentType,
+        use_cache: bool = True,
+        force_queue: bool = False,
+        extra_params: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """
+        Генерирует контент на основе промпта
+
+        Args:
+            user_id: ID пользователя
+            prompt: Текст промпта
+            content_type: Тип контента
+            use_cache: Использовать ли кэширование
+            force_queue: Принудительно использовать очередь вместо прямой генерации
+            extra_params: Дополнительные параметры для генерации
+
+        Returns:
+            str: Сгенерированный текст
+        """
+        try:
+            # Логируем детали запроса
+            logger.info(f"Генерация контента типа: {content_type.value if hasattr(content_type, 'value') else content_type}")
+            logger.info(f"Параметры: user_id={user_id}, use_cache={use_cache}, force_queue={force_queue}")
+
+            if extra_params:
+                logger.info(f"Дополнительные параметры: {json.dumps(extra_params, ensure_ascii=False, default=str)[:200]}...")
+
+            # Создаем кэш-ключ
+            cache_key = self._create_cache_key(prompt, content_type, extra_params)
+
+            # Проверяем кэш, если use_cache=True
+            if use_cache:
+                cached_content = await self.cache_service.get_cached_data(cache_key)
+                if cached_content:
+                    logger.info(f"Найден кэшированный контент, длина: {len(cached_content) if isinstance(cached_content, str) else 'не строка'}")
+                    return cached_content
+
+            # Валидируем длину промпта
+            self._validate_prompt(prompt, content_type)
+
+            # Проверяем и инициализируем G4FHandler
+            if not force_queue and await self.ensure_g4f_handler():
+                # Пытаемся сгенерировать с использованием G4FHandler
+                try:
+                    logger.info("Генерация контента через G4FHandler")
+                    content = await self._generate_with_g4f(prompt, content_type)
+                    if content:
+                        # Кэшируем результат, если use_cache=True
+                        if use_cache:
+                            await self.cache_service.cache_data(cache_key, content, ttl=3600)
+
+                        # Для структурированных данных, проверяем формат
+                        if content_type == ContentType.STRUCTURED_DATA:
+                            logger.info(f"Проверка формата структурированных данных, длина контента: {len(content)}")
+                            try:
+                                if isinstance(content, str):
+                                    # Для строковых данных, попытка найти валидный JSON
+                                    content = content.strip()
+                                    start_idx = content.find('{')
+                                    end_idx = content.rfind('}') + 1
+
+                                    if start_idx >= 0 and end_idx > start_idx:
+                                        json_str = content[start_idx:end_idx]
+                                        logger.info(f"Извлечен JSON из контента, длина: {len(json_str)}")
+                                        # Проверка валидности JSON
+                                        try:
+                                            json.loads(json_str)
+                                            return content
+                                        except json.JSONDecodeError as je:
+                                            logger.error(f"Ошибка декодирования JSON: {str(je)}")
+                                            logger.error(f"Фрагмент JSON: {json_str[:200]}...")
+                                            # Продолжаем выполнение, попробуем резервный метод
+                                    else:
+                                        logger.error("Не удалось найти валидный JSON в сгенерированном контенте")
+                                else:
+                                    # Если контент уже не строка, возвращаем как есть
+                                    return content
+                            except Exception as e:
+                                logger.error(f"Ошибка при проверке формата структурированных данных: {str(e)}")
+                                # Продолжаем выполнение, попробуем резервный метод
+                        else:
+                            # Для не структурированных данных возвращаем как есть
+                            return content
+                except Exception as g4f_error:
+                    # Логируем ошибку G4FHandler
+                    logger.error(f"Ошибка генерации через G4FHandler: {str(g4f_error)}")
+                    logger.info("Переключение на резервный метод генерации через очередь")
+
+            # Резервный метод: генерация через очередь
+            logger.info("Генерация контента через очередь (резервный метод)")
+            content = await self._generate_with_queue(user_id, prompt, content_type)
+
+            if content:
+                # Кэшируем результат, если use_cache=True
+                if use_cache:
+                    await self.cache_service.cache_data(cache_key, content, ttl=3600)
+                return content
+            else:
+                logger.error("Оба метода генерации (G4FHandler и очередь) не смогли сгенерировать контент")
+                return "Не удалось сгенерировать контент. Пожалуйста, попробуйте позже или обратитесь в поддержку."
+
+        except Exception as e:
+            logger.error(f"Критическая ошибка при генерации контента: {str(e)}")
+            import traceback
+            logger.error(f"Трассировка: {traceback.format_exc()}")
+            return "Произошла ошибка при генерации контента. Пожалуйста, попробуйте позже."
+
+    async def _save_generation(self, batch: List[Dict[str, Any]]) -> None:
+        """Batch save generations"""
+        generations = [
+            Generation(
+                user_id=item["user_id"],
+                type=item["type"].value if hasattr(item["type"], "value") else item["type"],
+                content=item["content"],
+                prompt=item["prompt"],
+                created_at=datetime.utcnow()
+            )
+            for item in batch
+        ]
+        self.session.add_all(generations)
+        await self.session.flush()
+
+    async def _get_user_priority(self, user_id: int) -> int:
+        """Get user priority for queue"""
+        query = await self.query_optimizer.optimize_query(
+            select(User).where(User.id == user_id)
+        )
+        result = await self.session.execute(query)
+        user = result.scalar_one_or_none()
+
+        if not user:
+            return 0
+
+        # Priority based on tariff and points
+        priority = 0
+        if user.tariff:
+            priority += {
+                'tariff_2': 1,
+                'tariff_4': 2,
+                'tariff_6': 3
+            }.get(user.tariff, 0)
+
+        priority += min(user.points // 1000, 5)  # Up to 5 additional points for points
+        return priority
+
+    def _validate_prompt(self, prompt: str, content_type: Union[str, ContentType]) -> None:
+        """Validate prompt length based on content type"""
+        # Define max lengths for different content types
+        max_lengths = {
+            ContentType.LESSON_PLAN: 15000,  # Увеличиваем лимит для планов уроков до 15000 символов
+            ContentType.EXERCISE: 15000,  # Увеличиваем лимит для упражнений до 15000 символов
+            ContentType.GAME: 15000,  # Увеличиваем лимит для игр до 15000 символов
+            ContentType.TRANSCRIPT: 500,
+            ContentType.TEXT_ANALYSIS: 15000,  # Увеличиваем лимит для анализа текста до 15000 символов
+            ContentType.STRUCTURED_DATA: 30000,  # Увеличиваем лимит для структурированных данных до 30000 символов
+            ContentType.COURSE: 30000,  # Увеличиваем лимит для генерации курса до 30000 символов
+            'lesson_plan': 15000,  # Увеличиваем лимит для планов уроков (строковый вариант) до 15000 символов
+            'exercise': 15000,  # Увеличиваем лимит для упражнений (строковый вариант) до 15000 символов
+            'game': 15000,  # Увеличиваем лимит для игр (строковый вариант) до 15000 символов
+            'transcript': 500,
+            'text_analysis': 15000,  # Увеличиваем лимит для анализа текста (строковый вариант) до 15000 символов
+            'structured_data': 30000,  # Увеличиваем лимит для структурированных данных (строковый вариант) до 30000 символов
+            'course': 30000,  # Увеличиваем лимит для генерации курса (строковый вариант) до 30000 символов
+            'image': 200
+        }
+
+        # Get max_length based on content_type (can be string or enum)
+        max_length = max_lengths.get(content_type, 500)
+
+        if len(prompt) > max_length:
+            ct_value = content_type.value if hasattr(content_type, 'value') else content_type
+            raise ValidationError(f"Prompt too long for {ct_value}")
+
+    @memory_optimized()
+    async def generate_lesson_plan(
+            self,
+            user_id: int,
+            course_id: Optional[int] = None,
+            lesson_data: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """Generate lesson plan with optimization"""
+        try:
+            # Prepare context for generation
+            context = await self._prepare_lesson_context(course_id, lesson_data)
+
+            # Create prompt
+            prompt = self._create_lesson_plan_prompt(context)
+
+            # Generate content through queue
+            content = await self.generate_content(
+                content_type=ContentType.LESSON_PLAN,
+                prompt=prompt,
+                user_id=user_id,
+                extra_params=context
+            )
+
+            # Structure result
+            lesson_plan = self._structure_lesson_plan(content)
+
+            # If there's a course, link it
+            if course_id:
+                await self._link_lesson_to_course(
+                    course_id,
+                    lesson_plan
+                )
+
+            return lesson_plan
+
+        except Exception as e:
+            logger.error(f"Error generating lesson plan: {str(e)}")
+            raise
+
+    async def _prepare_lesson_context(self, course_id: Optional[int], lesson_data: Optional[Dict[
+        str, Any]]) -> Dict[
+        str, Any]:
+        """Prepare context for lesson generation"""
+        context = lesson_data or {}
+
+        if course_id:
+            # Get course information to provide context
+            query = select(Course).where(Course.id == course_id)
+            result = await self.session.execute(query)
+            course = result.scalar_one_or_none()
+
+            if course:
+                context.update({
+                    "course_title": course.title,
+                    "course_description": course.description,
+                    "course_level": course.level,
+                    "course_language": course.language
+                })
+
+                # Get previous lessons in the course
+                lessons_query = select(Lesson).where(Lesson.course_id == course_id).order_by(Lesson.id.desc()).limit(1)
+                result = await self.session.execute(lessons_query)
+                previous_lesson = result.scalar_one_or_none()
+
+                if previous_lesson:
+                    context["previous_lesson"] = previous_lesson.title
+                    context["previous_content"] = previous_lesson.content
+
+        return context
+
+    def _create_lesson_plan_prompt(self, context: Dict[str, Any]) -> str:
+        """Create prompt for lesson plan generation with methodology-specific criteria"""
+
+        # Используем улучшенную функцию из content.py
+        from ..api.v1.content import format_prompt_lesson_plan_form
+
+        # Преобразуем context в формат, ожидаемый format_prompt_lesson_plan_form
+        form_data = {
+            'language': context.get('language', 'English'),
+            'level': context.get('level', 'Intermediate'),
+            'topic': context.get('topic', 'General communication'),
+            'previous_lesson': context.get('previous_lesson', ''),
+            'age': context.get('age', 'adults'),
+            'methodology': context.get('methodology', []),
+            'individual_group': context.get('individual_group', 'group'),
+            'online_offline': context.get('online_offline', 'offline'),
+            'duration': context.get('duration', 60),
+            'grammar': context.get('grammar', ''),
+            'vocabulary': context.get('vocabulary', ''),
+            'exam': context.get('exam', '')
+        }
+
+        # Используем улучшенную функцию генерации промпта
+        return format_prompt_lesson_plan_form(form_data)
+
+    def _structure_lesson_plan(self, content: str) -> Dict[str, Any]:
+        """Structure the raw generated content into a lesson plan format"""
+        # Simple parser for the content
+        sections = {
+            "title": "",
+            "objectives": [],
+            "materials": [],
+            "warm_up": "",
+            "main_activities": [],
+            "practice": [],
+            "assessment": "",
+            "homework": ["Домашнее задание 1", "Домашнее задание 2"],
+            "notes": ""
+        }
+
+        # Very basic parsing - in a real app, you'd want more robust parsing
+        current_section = None
+        lines = content.split('\n')
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+
+            # Try to identify sections
+            lower_line = line.lower()
+            if "objectives" in lower_line or "goals" in lower_line:
+                current_section = "objectives"
+                continue
+            elif "materials" in lower_line or "resources" in lower_line:
+                current_section = "materials"
+                continue
+            elif "warm" in lower_line and ("up" in lower_line or "activity" in lower_line):
+                current_section = "warm_up"
+                continue
+            elif "main" in lower_line and "activit" in lower_line:
+                current_section = "main_activities"
+                continue
+            elif "practice" in lower_line:
+                current_section = "practice"
+                continue
+            elif "assessment" in lower_line or "evaluation" in lower_line:
+                current_section = "assessment"
+                continue
+            elif "homework" in lower_line or "assignment" in lower_line:
+                current_section = "homework"
+                continue
+            elif "notes" in lower_line or "additional" in lower_line:
+                current_section = "notes"
+                continue
+            elif current_section is None and not sections["title"]:
+                sections["title"] = line
+                continue
+
+            # Process content based on current section
+            if current_section == "objectives" and line.startswith("- "):
+                sections["objectives"].append(line[2:])
+            elif current_section == "materials" and line.startswith("- "):
+                sections["materials"].append(line[2:])
+            elif current_section == "warm_up":
+                sections["warm_up"] += line + "\n"
+            elif current_section == "main_activities" and line.startswith("- "):
+                sections["main_activities"].append(line[2:])
+            elif current_section == "practice" and line.startswith("- "):
+                sections["practice"].append(line[2:])
+            elif current_section == "assessment":
+                sections["assessment"] += line + "\n"
+            elif current_section == "homework":
+                sections["homework"] += line + "\n"
+            elif current_section == "notes":
+                sections["notes"] += line + "\n"
+            elif current_section:  # Catch-all for non-bullet points in list sections
+                if current_section in ["warm_up", "assessment", "homework", "notes"]:
+                    sections[current_section] += line + "\n"
+
+        return sections
+
+    async def _link_lesson_to_course(self, course_id: int, lesson_plan: Dict[str, Any]) -> None:
+        """Link lesson to course"""
+        lesson = Lesson(
+            course_id=course_id,
+            title=lesson_plan.get('title', ''),
+            content=lesson_plan,
+            created_at=datetime.utcnow()
+        )
+        self.session.add(lesson)
+        await self.session.flush()
+
+    @memory_optimized()
+    async def generate_exercises(
+            self,
+            user_id: int,
+            params: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        """Generate exercises with optimization"""
+        try:
+            # Check parameters
+            self._validate_exercise_params(params)
+
+            # Create prompt
+            prompt = self._create_exercises_prompt(params)
+
+            # Generate content through queue
+            content = await self.generate_content(
+                content_type=ContentType.EXERCISE,
+                prompt=prompt,
+                user_id=user_id,
+                extra_params=params
+            )
+
+            # Structure exercises
+            raw_exercises = self._structure_exercises(content)
+
+            # Подготовка данных для сохранения - добавляем user_id и дополнительные поля
+            exercises_to_save = []
+            for ex in raw_exercises:
+                exercise_data = {
+                    "user_id": user_id,
+                    "type": ContentType.EXERCISE.value,
+                    "content": ex,  # Сохраняем всю структуру упражнения
+                    "prompt": prompt,  # Сохраняем промпт, который использовался для генерации
+                    "difficulty": params.get("difficulty", "medium")
+                }
+                exercises_to_save.append(exercise_data)
+
+            # Batch save exercises если список не пустой
+            if exercises_to_save:
+                await self.batch_processor.process_in_batches(
+                    exercises_to_save,
+                    self._save_exercises
+                )
+
+            return raw_exercises
+
+        except Exception as e:
+            logger.error(f"Error generating exercises: {str(e)}")
+            raise
+
+    async def _save_exercises(self, batch: List[Dict[str, Any]]) -> None:
+        """Batch save exercises"""
+        try:
+            # Используем существующую модель Generation для сохранения упражнений
+            generations = [
+                Generation(
+                    user_id=item.get("user_id"),
+                    type=item.get("type"),
+                    content=str(item.get("content")),  # Преобразуем словарь в строку
+                    prompt=str(item.get("prompt", "")),  # Устанавливаем пустую строку, если prompt нет
+                    created_at=datetime.utcnow()
+                )
+                for item in batch if item.get("content")
+            ]
+
+            if generations:
+                self.session.add_all(generations)
+                await self.session.flush()
+
+        except Exception as e:
+            logger.error(f"Ошибка при сохранении упражнений: {str(e)}")
+            raise
+
+    def _validate_exercise_params(self, params: Dict[str, Any]) -> None:
+        """Validate parameters for exercise generation"""
+        required_params = ['language', 'topic', 'difficulty', 'quantity']
+        for param in required_params:
+            if param not in params:
+                raise ValidationError(f"Missing required parameter: {param}")
+
+        if not 1 <= params.get('quantity', 0) <= 10:
+            raise ValidationError("Quantity must be between 1 and 10")
+
+    def _create_exercises_prompt(self, params: Dict[str, Any]) -> str:
+        """Create prompt for exercise generation"""
+
+        # Получаем метаданные или инициализируем пустой словарь
+        meta = params.get('meta', {})
+
+        # Формируем инструкции для индивидуальных/групповых занятий
+        format_instruction = ""
+        if params.get('individual_group') == 'individual':
+            format_instruction = """
+!!! IMPORTANT !!!
+This is an INDIVIDUAL lesson (one-on-one teaching). The exercises should:
+- Be designed for one-on-one interaction between teacher and student
+- NOT include any pair or group activities
+- Focus on personalized feedback and individual practice
+- Avoid phrases like "work with a partner" or "discuss in groups"
+            """
+        elif params.get('individual_group') == 'group':
+            format_instruction = """
+The exercises should be designed for GROUP teaching:
+- Include activities where students can work together
+- Incorporate peer interaction and collaborative tasks
+- Utilize group dynamics for language practice
+            """
+
+        # Формируем инструкции для онлайн/оффлайн занятий
+        online_instruction = ""
+        if params.get('online_offline') == 'online':
+            online_instruction = """
+The exercises should be adapted for ONLINE teaching:
+- Utilize digital tools and platforms
+- Be suitable for screen sharing and virtual interaction
+- Consider the limitations of online communication
+            """
+        elif params.get('online_offline') == 'offline':
+            online_instruction = """
+The exercises should be adapted for OFFLINE teaching:
+- Utilize physical materials and classroom resources
+- Take advantage of face-to-face interaction
+- Include physical movement and tactile elements when appropriate
+            """
+
+        # Дополнительные опции
+        additional_options = ""
+        if meta.get('includeAnswers', True):
+            additional_options += "- Include ANSWER KEYS for all exercises\n"
+        if meta.get('includeInstructions', True):
+            additional_options += "- Include TEACHER INSTRUCTIONS with suggestions for implementation\n"
+        if meta.get('adaptiveDifficulty', False):
+            additional_options += "- Provide variations for different proficiency levels within the same exercise\n"
+
+        # Выбранные типы упражнений из метаданных
+        selected_types = meta.get('selectedTypes', [])
+        types_instruction = ""
+        if selected_types:
+            types_str = ", ".join(selected_types)
+            types_instruction = f"Focus on these exercise types: {types_str}"
+
+        # Выбранные форматы упражнений
+        selected_formats = meta.get('selectedFormats', [])
+        formats_instruction = ""
+        if selected_formats:
+            formats_str = ", ".join(selected_formats)
+            formats_instruction = f"Use these exercise formats: {formats_str}"
+
+        # Основной шаблон промпта
+        prompt_template = """
+        Create {quantity} {difficulty} level exercises for {language} language learners.
+        Topic: {topic}
+Proficiency level: {proficiency}
+Exercise Type: {exercise_type}
+
+{types_instruction}
+{formats_instruction}
+{format_instruction}
+{online_instruction}
+
+        Each exercise should include:
+1. Clear instructions for students
+2. The exercise content
+3. Any necessary materials or resources
+{additional_options}
+
+        Make the exercises interactive, appropriate for the level, and focused on the topic.
+        """
+
+        return prompt_template.format(
+            quantity=params.get('quantity', 3),
+            difficulty=params.get('difficulty', 'intermediate'),
+            language=params.get('language', 'English'),
+            topic=params.get('topic', 'General'),
+            proficiency=meta.get('proficiency', 'intermediate'),
+            exercise_type=params.get('exercise_type', 'grammar'),
+            types_instruction=types_instruction,
+            formats_instruction=formats_instruction,
+            format_instruction=format_instruction,
+            online_instruction=online_instruction,
+            additional_options=additional_options
+        )
+
+    def _structure_exercises(self, content: str) -> List[Dict[str, Any]]:
+        """Structure the raw generated content into exercises"""
+        exercises = []
+
+        # Журналирование для отладки
+        logger.info(f"Начало парсинга упражнений. Длина контента: {len(content)} символов")
+
+        try:
+            # Проверка наличия разделов ответов и инструкций
+            has_answers = "answers" in content.lower() or "answer key" in content.lower() or "answer keys" in content.lower()
+            has_instructions = "teacher instructions" in content.lower() or "teaching notes" in content.lower()
+
+            logger.info(f"Определение секций: answers={has_answers}, instructions={has_instructions}")
+
+            # Пытаемся разделить контент на упражнения по маркерам
+            # Проверяем различные формы маркеров упражнений
+            if "exercise" in content.lower():
+                sections = re.split(r"(?i)## Exercise \d+:", content)
+                logger.info(f"Разделение по 'Exercise N': получено {len(sections)} секций")
+            elif "упражнение" in content.lower():
+                sections = re.split(r"(?i)упражнение\s*\d+[\.:]?", content)
+                logger.info(f"Разделение по 'Упражнение N': получено {len(sections)} секций")
+            else:
+                # Если не нашли стандартных маркеров, рассматриваем весь текст как одно упражнение
+                logger.info(f"Не найдены стандартные маркеры упражнений. Возвращаем весь контент как одно упражнение.")
+                return [{
+                    "type": "general",
+                    "content": content,
+                    "answers": "",
+                    "instructions": ""
+                }]
+
+            # Убираем первую пустую секцию, если она есть
+            if sections and not sections[0].strip():
+                sections = sections[1:]
+
+            if not sections:
+                logger.warning("После разделения не найдено упражнений. Возвращаем весь контент как одно упражнение.")
+                return [{
+                    "type": "general",
+                    "content": content,
+                    "answers": "",
+                    "instructions": ""
+                }]
+
+            # Обрабатываем каждую секцию
+            for i, section in enumerate(sections, 1):
+                if not section.strip():
+                    continue
+
+                logger.info(f"Обработка упражнения {i}, длина секции: {len(section)} символов")
+
+                exercise = {
+                    "type": "general",
+                    "content": "",
+                    "answers": "",
+                    "instructions": ""
+                }
+
+                # Ищем секцию ответов (может быть в разных форматах)
+                answer_patterns = [
+                    r"(?i)###\s*answer\s*keys?.*?$",
+                    r"(?i)answer\s*keys?:?.*?$",
+                    r"(?i)answers:?.*?$",
+                    r"(?i)ответы:?.*?$",
+                    r"(?i)solutions?:?.*?$"
+                ]
+
+                # Ищем секцию инструкций
+                instruction_patterns = [
+                    r"(?i)###\s*teacher\s*instructions.*?$",
+                    r"(?i)teacher\s*instructions:?.*?$",
+                    r"(?i)teaching\s*notes:?.*?$",
+                    r"(?i)инструкции\s*для\s*учителя:?.*?$",
+                    r"(?i)notes\s*for\s*teacher:?.*?$"
+                ]
+
+                content_parts = {}
+                current_section = section
+
+                # Извлекаем ответы
+                answers_match = None
+                for pattern in answer_patterns:
+                    matches = re.search(pattern, current_section, re.MULTILINE)
+                    if matches:
+                        answers_match = matches
+                        break
+
+                if answers_match:
+                    split_pos = answers_match.start()
+                    content_parts['content'] = current_section[:split_pos].strip()
+                    content_parts['answers'] = current_section[split_pos:].strip()
+                    current_section = content_parts['content']  # Обновляем текущую секцию для дальнейшего поиска
+                else:
+                    content_parts['content'] = current_section
+                    content_parts['answers'] = ""
+
+                # Извлекаем инструкции
+                instructions_match = None
+                for pattern in instruction_patterns:
+                    matches = re.search(pattern, current_section, re.MULTILINE)
+                    if matches:
+                        instructions_match = matches
+                        break
+
+                if instructions_match:
+                    split_pos = instructions_match.start()
+                    # Обновляем содержимое, отделяя инструкции
+                    content_parts['instructions'] = current_section[split_pos:].strip()
+                    content_parts['content'] = current_section[:split_pos].strip()
+                else:
+                    content_parts['instructions'] = ""
+
+                # Если в ответах есть инструкции, обрабатываем их
+                for pattern in instruction_patterns:
+                    if content_parts['answers']:
+                        matches = re.search(pattern, content_parts['answers'], re.MULTILINE)
+                        if matches:
+                            split_pos = matches.start()
+                            content_parts['instructions'] = content_parts['answers'][split_pos:].strip()
+                            content_parts['answers'] = content_parts['answers'][:split_pos].strip()
+                            break
+
+                # Заполняем данные упражнения
+                exercise['content'] = content_parts['content'].strip()
+                exercise['answers'] = content_parts['answers'].strip()
+                exercise['instructions'] = content_parts['instructions'].strip()
+
+                # Определяем тип упражнения (если возможно)
+                exercise_type_patterns = {
+                    "grammar": r"(?i)(grammar|грамматик|tense|время|артикл|предлог|союз|синтакс)",
+                    "vocabulary": r"(?i)(vocabulary|словар|лексик|слов|term|термин)",
+                    "reading": r"(?i)(reading|чтени|текст|passage|отрыв)",
+                    "writing": r"(?i)(writing|письм|composition|сочинени|эссе|essay)",
+                    "speaking": r"(?i)(speaking|говорени|диалог|монолог|conversation|разговор)",
+                    "listening": r"(?i)(listening|аудировани|слушани)"
+                }
+
+                for type_key, pattern in exercise_type_patterns.items():
+                    if re.search(pattern, exercise['content']):
+                        exercise['type'] = type_key
+                        break
+
+                # Логируем результат
+                logger.info(f"Упражнение {i} обработано: {len(exercise['content'])} символов контента, " +
+                           f"{len(exercise['answers'])} символов ответов, {len(exercise['instructions'])} символов инструкций")
+
+                exercises.append(exercise)
+
+            logger.info(f"Успешно обработано {len(exercises)} упражнений")
+            return exercises
+
+        except Exception as e:
+            logger.error(f"Ошибка при обработке структуры упражнений: {str(e)}")
+            # В случае ошибки возвращаем весь контент как одно упражнение
+            return [{
+                "type": "general",
+                "content": content,
+                "answers": "",
+                "instructions": ""
+            }]
+    @memory_optimized()
+    async def generate_game(
+            self,
+            user_id: int,
+            params: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Generate game with optimization"""
+        try:
+            # Check parameters
+            self._validate_game_params(params)
+
+            # Create prompt
+            prompt = self._create_game_prompt(params)
+
+            # Generate content through queue
+            content = await self.generate_content(
+                content_type=ContentType.GAME,
+                prompt=prompt,
+                user_id=user_id,
+                extra_params=params
+            )
+
+            # Structure game
+            game = self._structure_game(content)
+
+            return game
+
+        except Exception as e:
+            logger.error(f"Error generating game: {str(e)}")
+            raise
+
+    def _validate_game_params(self, params: Dict[str, Any]) -> None:
+        """Validate parameters for game generation"""
+        required_params = ['language', 'topic', 'game_type', 'duration']
+        for param in required_params:
+            if param not in params:
+                raise ValidationError(f"Missing required parameter: {param}")
+
+        if not 5 <= params.get('duration', 0) <= 60:
+            raise ValidationError("Duration must be between 5 and 60 minutes")
+
+        # Проверяем формат игры, если он указан
+        if 'format' in params and params['format'] not in ['individual', 'group']:
+            raise ValidationError("Format must be either 'individual' or 'group'")
+
+        # Проверяем тип контента, если он отсутствует, добавляем его
+        if 'type' not in params:
+            params['type'] = ContentType.GAME
+
+    def _create_game_prompt(self, params: Dict[str, Any]) -> str:
+        """Create prompt for game generation with multilingual approach"""
+
+        # Получаем язык обучения
+        target_language = params.get('language', 'English')
+
+        # Определяем название языка на русском
+        language_names_russian = {
+            'english': 'английского языка',
+            'spanish': 'испанского языка',
+            'french': 'французского языка',
+            'german': 'немецкого языка',
+            'italian': 'итальянского языка',
+            'chinese': 'китайского языка',
+            'japanese': 'японского языка',
+            'korean': 'корейского языка',
+            'turkish': 'турецкого языка',
+            'arabic': 'арабского языка',
+            'portuguese': 'португальского языка',
+            'dutch': 'голландского языка',
+            'polish': 'польского языка',
+            'czech': 'чешского языка',
+            'hungarian': 'венгерского языка',
+            'finnish': 'финского языка',
+            'swedish': 'шведского языка',
+            'norwegian': 'норвежского языка',
+            'danish': 'датского языка',
+            'greek': 'греческого языка',
+            'hebrew': 'иврита',
+            'hindi': 'хинди',
+            'thai': 'тайского языка',
+            'vietnamese': 'вьетнамского языка',
+            'ukrainian': 'украинского языка',
+            'bulgarian': 'болгарского языка',
+            'croatian': 'хорватского языка',
+            'serbian': 'сербского языка',
+            'slovenian': 'словенского языка',
+            'slovak': 'словацкого языка',
+            'lithuanian': 'литовского языка',
+            'latvian': 'латышского языка',
+            'estonian': 'эстонского языка',
+            'romanian': 'румынского языка'
+        }
+
+        language_name_russian = language_names_russian.get(target_language.lower(), f'{target_language} языка')
+
+        # Определяем формат игры (индивидуальный или групповой)
+        format_instruction = ""
+        if params.get('format') == 'individual':
+            format_instruction = "Эта игра должна быть разработана для индивидуальной игры (один ученик с учителем)."
+        elif params.get('format') == 'group':
+            format_instruction = "Эта игра должна быть разработана для групповой игры (несколько учеников)."
+
+        prompt_template = f"""
+        ВАЖНО: Создай игру для обучения {language_name_russian} для русскоговорящих учителей.
+
+        КРИТИЧЕСКИ ВАЖНО - ЯЗЫКОВОЕ РАЗДЕЛЕНИЕ:
+        - ВСЕ ИНСТРУКЦИИ ДЛЯ УЧИТЕЛЯ должны быть написаны на РУССКОМ языке
+        - ВСЕ ИГРОВЫЕ МАТЕРИАЛЫ И ЗАДАНИЯ ДЛЯ УЧЕНИКОВ должны быть написаны на {target_language.upper()} языке
+        - Правила игры и объяснения - на русском для учителя
+        - Карточки, вопросы, задания - на {target_language.upper()} для учеников
+
+        Параметры игры:
+        - Тип игры: {{game_type}}
+        - Тема: {{topic}}
+        - Продолжительность: {{duration}} минут
+        - Возрастная группа: {{age_group}}
+        {{format_instruction}}
+
+        Включи следующие разделы:
+        1. Название игры (на русском)
+        2. Необходимые материалы (описание на русском)
+        3. Инструкции по подготовке (на русском для учителя)
+        4. Правила игры (на русском для учителя)
+        5. Система подсчета очков (на русском)
+        6. Вариации игры (опционально, на русском)
+
+        Игровые материалы (карточки, вопросы, задания) должны быть на {target_language.upper()} языке.
+        Сделай игру увлекательной, интерактивной и подходящей для изучения языка.
+        """
+
+        return prompt_template.format(
+            game_type=params.get('game_type', 'языковая'),
+            topic=params.get('topic', 'Общая тема'),
+            duration=params.get('duration', 15),
+            age_group=params.get('age_group', 'взрослые'),
+            format_instruction=format_instruction
+        )
+
+    def _structure_game(self, content: str) -> Dict[str, Any]:
+        """Structure the raw generated content into a game format"""
+        game = {
+            "title": "",
+            "materials": [],
+            "setup": "",
+            "rules": "",
+            "scoring": "",
+            "variations": []
+        }
+
+        # Basic parsing
+        lines = content.split('\n')
+        current_section = None
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+
+            lower_line = line.lower()
+            if game["title"] == "" and current_section is None:
+                game["title"] = line
+                continue
+            elif "materials" in lower_line or "requirements" in lower_line:
+                current_section = "materials"
+                continue
+            elif "setup" in lower_line or "preparation" in lower_line:
+                current_section = "setup"
+                continue
+            elif "rules" in lower_line or "how to play" in lower_line:
+                current_section = "rules"
+                continue
+            elif "scoring" in lower_line or "points" in lower_line:
+                current_section = "scoring"
+                continue
+            elif "variations" in lower_line or "alternatives" in lower_line:
+                current_section = "variations"
+                continue
+
+            if current_section == "materials" and line.startswith("- "):
+                game["materials"].append(line[2:])
+            elif current_section == "setup":
+                game["setup"] += line + "\n"
+            elif current_section == "rules":
+                game["rules"] += line + "\n"
+            elif current_section == "scoring":
+                game["scoring"] += line + "\n"
+            elif current_section == "variations" and line.startswith("- "):
+                game["variations"].append(line[2:])
+
+        return game
+
+
+
+    async def _generate_with_g4f(self, prompt: str, content_type: ContentType) -> Optional[str]:
+        """
+        Генерирует контент с использованием доступных провайдеров
+        в порядке приоритета: Gemini -> Mistral -> G4F
+
+        Args:
+            prompt: Текст промпта для генерации
+            content_type: Тип контента
+
+        Returns:
+            Optional[str]: Сгенерированный текст или None в случае ошибки
+        """
+        try:
+            # Адаптируем промпт в зависимости от типа контента
+            if content_type == ContentType.IMAGE:
+                logger.info(f"Генерация изображения с использованием специализированных провайдеров")
+                # Для изображений используем специальный метод
+                if self.g4f_handler:
+                    image_url = await self.g4f_handler.generate_image(prompt)
+                    return image_url
+                else:
+                    logger.error("G4FHandler не инициализирован для генерации изображений")
+                    return "Не удалось сгенерировать изображение. Провайдер недоступен."
+            else:
+                # Для текстового контента выбираем провайдера по приоритету
+
+                # 1. Пробуем использовать Gemini API (высший приоритет)
+                if self._gemini_available and self.gemini_handler:
+                    try:
+                        logger.info(f"Начало генерации контента типа {content_type.value} с использованием Gemini API")
+
+                        # Получаем сгенерированный контент через Gemini API
+                        generated_content = await self.gemini_handler.generate_content(
+                            prompt=prompt,
+                            temperature=0.7,
+                            max_tokens=2048
+                        )
+
+                        if generated_content:
+                            logger.info(f"Контент успешно сгенерирован через Gemini API, длина: {len(generated_content)}")
+                            return generated_content
+                        else:
+                            logger.warning("Gemini API вернул пустой ответ, переключаемся на Mistral")
+                    except Exception as e:
+                        logger.error(f"Ошибка при генерации через Gemini API: {str(e)}")
+                        logger.info("Переключаемся на Mistral API")
+
+                # 2. Пробуем использовать OpenRouter API (высокий приоритет)
+                if self._openrouter_available and self.openrouter_handler:
+                    try:
+                        logger.info(f"Начало генерации контента типа {content_type.value} с использованием OpenRouter API")
+
+                        # Получаем сгенерированный контент через OpenRouter API
+                        generated_content = await self.openrouter_handler.generate_content(
+                            prompt=prompt,
+                            temperature=0.7,
+                            max_tokens=2048
+                        )
+
+                        if generated_content:
+                            logger.info(f"Контент успешно сгенерирован через OpenRouter API, длина: {len(generated_content)}")
+                            return generated_content
+                        else:
+                            logger.warning("OpenRouter API вернул пустой ответ, переключаемся на Groq")
+                    except Exception as e:
+                        logger.error(f"Ошибка при генерации через OpenRouter API: {str(e)}")
+                        logger.info("Переключаемся на Groq")
+
+                # 3. Пробуем использовать Groq API (высокий приоритет)
+                if self._groq_available and self.groq_handler:
+                    try:
+                        logger.info(f"Начало генерации контента типа {content_type.value} с использованием Groq API")
+
+                        # Получаем сгенерированный контент через Groq API
+                        generated_content = await self.groq_handler.generate_content(
+                            prompt=prompt,
+                            temperature=0.7,
+                            max_tokens=2048
+                        )
+
+                        if generated_content:
+                            logger.info(f"Контент успешно сгенерирован через Groq API, длина: {len(generated_content)}")
+                            return generated_content
+                        else:
+                            logger.warning("Groq API вернул пустой ответ, переключаемся на Mistral")
+                    except Exception as e:
+                        logger.error(f"Ошибка при генерации через Groq API: {str(e)}")
+                        logger.info("Переключаемся на Mistral")
+
+                # 4. Пробуем использовать Mistral API (средний приоритет)
+                if self._mistral_available and self.mistral_handler:
+                    try:
+                        logger.info(f"Начало генерации контента типа {content_type.value} с использованием Mistral API")
+
+                        # Получаем сгенерированный контент через Mistral API
+                        generated_content = await self.mistral_handler.generate_content(
+                            prompt=prompt,
+                            temperature=0.7,
+                            max_tokens=2048
+                        )
+
+                        if generated_content:
+                            logger.info(f"Контент успешно сгенерирован через Mistral API, длина: {len(generated_content)}")
+                            return generated_content
+                        else:
+                            logger.warning("Mistral API вернул пустой ответ, переключаемся на G4F")
+                    except Exception as e:
+                        logger.error(f"Ошибка при генерации через Mistral API: {str(e)}")
+                        logger.info("Переключаемся на G4F")
+
+                # 5. Используем G4F (низший приоритет)
+                if self._g4f_available and self.g4f_handler:
+                    logger.info(f"Начало генерации контента типа {content_type.value} с использованием G4F")
+
+                    # Получаем модель и провайдер для генерации
+                    model_info = await self.g4f_handler.get_available_model()
+                    if not model_info:
+                        logger.error("Не удалось получить доступную модель для генерации контента через G4F")
+                        return "Не удалось сгенерировать ответ. Пожалуйста, попробуйте еще раз или выберите другую модель."
+
+                    model, provider = model_info
+                    logger.info(f"Используем модель G4F {model} (провайдер: {provider.__name__ if hasattr(provider, '__name__') else provider})")
+
+                    # Получаем сгенерированный контент через G4F
+                    generated_content = await self.g4f_handler.generate_content(
+                        prompt=prompt,
+                        model=model,
+                        provider=provider
+                    )
+
+                    logger.info(f"Контент успешно сгенерирован через G4F, длина: {len(generated_content) if generated_content else 0}")
+
+                    if generated_content:
+                        return generated_content
+
+                logger.error("Все провайдеры генерации контента недоступны или вернули ошибки")
+                return "Не удалось сгенерировать ответ. Пожалуйста, попробуйте еще раз позже."
+
+        except Exception as e:
+            logger.error(f"Критическая ошибка при генерации контента: {str(e)}")
+            import traceback
+            logger.error(f"Трассировка: {traceback.format_exc()}")
+            return "Не удалось сгенерировать ответ из-за технической ошибки. Пожалуйста, попробуйте еще раз позже."
+
+    async def _generate_with_queue(
+            self,
+            user_id: int,
+            prompt: str,
+            content_type: ContentType
+    ) -> Optional[str]:
+        """
+        Fallback метод для генерации контента через очередь
+
+        Args:
+            user_id: ID пользователя
+            prompt: Текст промпта для генерации
+            content_type: Тип контента
+
+        Returns:
+            Optional[str]: Сгенерированный текст или None в случае ошибки
+        """
+        try:
+            # Получаем приоритет пользователя
+            user_priority = 0
+            if self.session is not None:
+                try:
+                    user_priority = await self._get_user_priority(user_id)
+                except Exception as e:
+                    logger.error(f"Ошибка при получении приоритета пользователя: {str(e)}")
+
+            # Инициализируем очередь
+            queue = None
+            try:
+                queue = await self.get_generation_queue()
+            except Exception as e:
+                logger.error(f"Ошибка при получении очереди генерации: {str(e)}")
+                return None
+
+            if queue is None:
+                logger.error("Очередь генерации равна None")
+                return None
+
+            # Добавляем задачу в очередь с приоритетом
+            task_id = await queue.add_to_queue(
+                user_id=user_id,
+                content_type=content_type.value,
+                prompt=prompt,
+                priority=user_priority
+            )
+
+            # Ожидаем завершения генерации с таймаутом
+            timeout = 300  # 5 минут
+            start_time = datetime.utcnow()
+
+            while True:
+                status = await queue.get_status(task_id)
+                if status['status'] == 'completed':
+                    return status['result']
+                elif status['status'] == 'error':
+                    error_message = status.get('error', 'Неизвестная ошибка')
+                    logger.error(f"Ошибка при генерации контента через очередь: {error_message}")
+                    return None
+
+                # Проверяем таймаут
+                if (datetime.utcnow() - start_time).total_seconds() > timeout:
+                    logger.error(f"Превышено время ожидания генерации через очередь ({timeout} секунд)")
+                    return None
+
+                # Небольшая пауза перед следующей проверкой
+                await asyncio.sleep(1)
+
+        except Exception as e:
+            logger.error(f"Ошибка при генерации контента через очередь: {str(e)}")
+            return None
+
+    async def get_g4f_status(self):
+        """
+        Получить текущий статус всех провайдеров генерации
+
+        Returns:
+            Dict: Статус доступности и информация о провайдерах
+        """
+        try:
+            # Проверяем доступность провайдеров
+            await self.ensure_g4f_handler()
+
+            # Проверяем доступность Groq прокси
+            groq_proxy_available = False
+            try:
+                from ...utils.groq_proxy_handler import GROQ_PROXY_AVAILABLE
+                groq_proxy_available = GROQ_PROXY_AVAILABLE
+            except ImportError:
+                pass
+
+            # Собираем информацию о всех провайдерах
+            openrouter_available = getattr(self, '_openrouter_available', False)
+            groq_direct_available = getattr(self, '_groq_available', False)
+
+            status = {
+                "available": self._gemini_available or openrouter_available or groq_direct_available or groq_proxy_available or self._mistral_available or self._g4f_available,
+                "providers": {
+                    "gemini": {
+                        "available": self._gemini_available,
+                        "model": "gemini-2.0-flash" if self._gemini_available else None,
+                        "type": "direct_api"
+                    },
+                    "openrouter": {
+                        "available": openrouter_available,
+                        "model": "google/gemini-2.0-flash-exp:free" if openrouter_available else None,
+                        "type": "direct_api"
+                    },
+                    "groq_direct": {
+                        "available": groq_direct_available,
+                        "model": "meta-llama/llama-4-maverick-17b-128e-instruct" if groq_direct_available else None,
+                        "type": "direct_api"
+                    },
+                    "groq_proxy": {
+                        "available": groq_proxy_available,
+                        "model": "meta-llama/llama-4-maverick-17b-128e-instruct" if groq_proxy_available else None,
+                        "type": "cloudflare_proxy"
+                    },
+                    "mistral": {
+                        "available": self._mistral_available,
+                        "model": "open-mistral-nemo" if self._mistral_available else None,
+                        "type": "direct_api"
+                    },
+                    "g4f": {
+                        "available": self._g4f_available,
+                        "type": "fallback"
+                    }
+                }
+            }
+
+            # Получаем информацию о модели G4F если доступна
+            if self._g4f_available and self.g4f_handler:
+                try:
+                    model_info = await self.g4f_handler.get_available_model()
+                    if model_info:
+                        model, provider = model_info
+                        status["providers"]["g4f"]["model"] = str(model)
+                        status["providers"]["g4f"]["provider"] = provider.__name__ if hasattr(provider, '__name__') else str(provider)
+                except Exception as e:
+                    logger.error(f"Ошибка при получении информации о модели G4F: {e}")
+                    status["providers"]["g4f"]["error"] = str(e)
+
+            return status
+
+        except Exception as e:
+            logger.error(f"Ошибка при получении статуса провайдеров: {e}")
+            return {
+                "available": False,
+                "error": str(e)
+            }
+
+    def set_generation_timeout(self, timeout: int):
+        """
+        Установить таймаут для генерации контента
+
+        Args:
+            timeout: Таймаут в секундах
+        """
+        if hasattr(self, 'g4f_handler'):
+            self.g4f_handler.set_timeout(timeout)
+            logger.info(f"Установлен таймаут генерации контента: {timeout} секунд")
+
+    async def clear_content_cache(self, content_type: Optional[ContentType] = None):
+        """
+        Очистить кэш сгенерированного контента
+
+        Args:
+            content_type: Тип контента для очистки или None для очистки всего кэша
+        """
+        try:
+            if content_type:
+                # Очищаем кэш для конкретного типа контента
+                pattern = f"*{content_type.value}*"
+                deleted = await self.cache_service.invalidate_pattern(pattern)
+                logger.info(f"Очищено {deleted} записей кэша для типа контента {content_type.value}")
+            else:
+                # Очищаем весь кэш контента
+                deleted = await self.cache_service.invalidate_pattern("*")
+                logger.info(f"Очищено {deleted} записей кэша контента")
+
+            return deleted
+        except Exception as e:
+            logger.error(f"Ошибка при очистке кэша контента: {str(e)}")
+            raise
+
+    # Context manager methods
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.session.close()
+
+    async def refresh_g4f_handler(self) -> bool:
+        """Обновляем провайдеры генерации и проверяем их доступность"""
+        try:
+            # Получаем API ключи из переменных окружения
+            mistral_api_key = os.environ.get("MISTRAL_API_KEY")
+            gemini_api_key = os.environ.get("GEMINI_API_KEY")
+            openrouter_api_key = os.environ.get("OPENROUTER_API_KEY")
+            groq_api_key = os.environ.get("GROQ_API_KEY")
+            llm7_api_key = os.environ.get("LLM7_API_KEY")
+
+            # Обновляем Gemini API если доступен ключ
+            if gemini_api_key:
+                try:
+                    from ...utils.gemini_api import GeminiHandler, GEMINI_AVAILABLE
+                    if GEMINI_AVAILABLE:
+                        self.gemini_handler = GeminiHandler(api_key=gemini_api_key)
+                        self._gemini_available = self.gemini_handler.is_available()
+                        logger.info(f"GeminiHandler переинициализирован и доступен: {self._gemini_available}")
+                    else:
+                        logger.warning("Библиотека Google Generative AI не установлена")
+                        self._gemini_available = False
+                except Exception as e:
+                    logger.error(f"Ошибка при переинициализации GeminiHandler: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+                    self._gemini_available = False
+            else:
+                logger.warning("API ключ Google Gemini не найден в переменных окружения")
+                self._gemini_available = False
+
+            # Обновляем Mistral API если доступен ключ
+            if mistral_api_key:
+                try:
+                    from ...utils.mistral_api import MistralHandler, MISTRAL_AVAILABLE
+                    if MISTRAL_AVAILABLE:
+                        self.mistral_handler = MistralHandler(api_key=mistral_api_key)
+                        self._mistral_available = self.mistral_handler.is_available()
+                        logger.info(f"MistralHandler переинициализирован и доступен: {self._mistral_available}")
+                    else:
+                        logger.warning("Библиотека Mistral не установлена")
+                        self._mistral_available = False
+                except Exception as e:
+                    logger.error(f"Ошибка при переинициализации MistralHandler: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+                    self._mistral_available = False
+            else:
+                logger.warning("API ключ Mistral не найден в переменных окружения")
+                self._mistral_available = False
+
+            # Обновляем OpenRouter API если доступен ключ
+            if openrouter_api_key:
+                try:
+                    from ...utils.openrouter_api import OpenRouterHandler, OPENROUTER_AVAILABLE
+                    if OPENROUTER_AVAILABLE:
+                        self.openrouter_handler = OpenRouterHandler(api_key=openrouter_api_key)
+                        self._openrouter_available = self.openrouter_handler.is_available()
+                        logger.info(f"OpenRouterHandler переинициализирован и доступен: {self._openrouter_available}")
+                    else:
+                        logger.warning("Модуль OpenRouter не доступен")
+                        self._openrouter_available = False
+                except Exception as e:
+                    logger.error(f"Ошибка при переинициализации OpenRouterHandler: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+                    self._openrouter_available = False
+            else:
+                logger.warning("API ключ OpenRouter не найден в переменных окружения")
+                self._openrouter_available = False
+
+            # Обновляем Groq API если доступен ключ
+            if groq_api_key:
+                try:
+                    from ...utils.groq_api import GroqHandler, GROQ_AVAILABLE
+                    if GROQ_AVAILABLE:
+                        self.groq_handler = GroqHandler(api_key=groq_api_key)
+                        self._groq_available = self.groq_handler.is_available()
+                        logger.info(f"GroqHandler переинициализирован и доступен: {self._groq_available}")
+                    else:
+                        logger.warning("Модуль Groq не доступен")
+                        self._groq_available = False
+                except Exception as e:
+                    logger.error(f"Ошибка при переинициализации GroqHandler: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+                    self._groq_available = False
+            else:
+                logger.warning("API ключ Groq не найден в переменных окружения")
+                self._groq_available = False
+
+            # Обновляем G4F
+            try:
+                from ...utils.g4f_handler import G4FHandler, G4F_AVAILABLE
+                if G4F_AVAILABLE:
+                    self.g4f_handler = G4FHandler(
+                        api_key=mistral_api_key,
+                        openrouter_api_key=openrouter_api_key,
+                        llm7_api_key=llm7_api_key,
+                        gemini_handler=self.gemini_handler if self._gemini_available else None,
+                        groq_handler=self.groq_handler if self._groq_available else None,
+                        together_handler=self.together_handler if self._together_available else None,
+                        cerebras_handler=self.cerebras_handler if self._cerebras_available else None,
+                        chutes_handler=self.chutes_handler if self._chutes_available else None
+                    )
+                    self._g4f_available = True
+                    logger.info("G4FHandler переинициализирован")
+                else:
+                    logger.warning("G4F не установлен, этот провайдер будет недоступен")
+                    self._g4f_available = False
+            except Exception as e:
+                logger.error(f"Ошибка при переинициализации G4FHandler: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+                self._g4f_available = False
+
+            # Возвращаем True, если хотя бы один провайдер доступен
+            providers_available = self._gemini_available or self._openrouter_available or self._groq_available or self._mistral_available or self._g4f_available
+            logger.info(f"Переинициализация провайдеров завершена (доступно: {providers_available})")
+            return providers_available
+
+        except Exception as e:
+            logger.error(f"Ошибка при переинициализации провайдеров: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
+
+    @memory_optimized()
+    async def generate_questions(
+        self,
+        text: str,
+        language: str,
+        num_questions: int = 5,
+        vocabulary: str = None,
+        grammar: str = None,
+        **kwargs
+    ) -> QuestionsAnalysis:
+        """Генерирует вопросы к тексту"""
+        try:
+            # Проверяем параметры
+            params = {
+                "text": text,
+                "language": language,
+                "num_questions": num_questions,
+                "vocabulary": vocabulary,
+                "grammar": grammar,
+                **kwargs
+            }
+            self._validate_question_params(params)
+
+            # Создаем промпт
+            prompt = self._create_questions_prompt(params, text, vocabulary, grammar)
+
+            # Генерируем контент
+            content = await self.generate_content(
+                user_id=params.get("user_id", 0),
+                prompt=prompt,
+                content_type=ContentType.TEXT_ANALYSIS,
+                use_cache=not params.get("force", False)
+            )
+
+            # Парсим и структурируем вопросы
+            questions = self._structure_questions(content)
+
+            # Создаем объект с результатами
+            return QuestionsAnalysis(questions=questions)
+
+        except Exception as e:
+            logger.error(f"Error generating questions: {str(e)}")
+            raise
+
+    def _validate_question_params(self, params: Dict[str, Any]) -> None:
+        """
+        Проверяет параметры для генерации вопросов.
+
+        Args:
+            params: Параметры для генерации вопросов
+        """
+        if not params.get("language"):
+            raise ValueError("Missing required parameter: language")
+
+        if not params.get("text"):
+            raise ValueError("Missing required parameter: text")
+
+        if not params.get("num_questions"):
+            raise ValueError("Missing required parameter: num_questions")
+
+        if not 1 <= params.get('num_questions', 0) <= 20:
+            raise ValueError("Number of questions must be between 1 and 20")
+
+    def _create_questions_prompt(self, params: Dict[str, Any], text: str, vocabulary: str = None, grammar: str = None) -> str:
+        """
+        Создает промпт для генерации вопросов.
+
+        Args:
+            params: Параметры для генерации вопросов
+            text: Текст для генерации вопросов
+            vocabulary: Дополнительный словарный запас
+            grammar: Дополнительная грамматика
+
+        Returns:
+            str: Промпт для генерации вопросов
+        """
+        language = params.get("language", "english")
+        difficulty = params.get("difficulty", "medium")
+        num_questions = params.get("num_questions", 5)
+
+        # Обрезаем текст, если он слишком длинный
+        max_text_length = 4000
+        if len(text) > max_text_length:
+            text = text[:max_text_length]
+
+        prompt = f"""You are a professional language teacher and expert in {language}.
+I will provide you with a text in {language}, and I need you to create {num_questions} questions about this text.
+
+The questions should be at {difficulty} difficulty level.
+"""
+
+        if vocabulary:
+            prompt += f"\nFocus on vocabulary related to: {vocabulary}.\n"
+
+        if grammar:
+            prompt += f"\nFocus on grammar topics related to: {grammar}.\n"
+
+        prompt += f"""
+Create {num_questions} comprehension questions based on the text below.
+For each question, provide multiple-choice options (A, B, C, D) and indicate the correct answer.
+
+TEXT:
+```
+{text}
+```
+
+Each question should:
+1. Be clear and directly related to the text
+2. Have exactly 4 options (A, B, C, D)
+3. Have only one correct answer
+4. Be at {difficulty} difficulty level
+
+Format your response as a structured JSON array with the following format:
+```json
+[
+  {{
+    "number": 1,
+    "question": "Question text here?",
+    "options": [
+      "Option A text",
+      "Option B text",
+      "Option C text",
+      "Option D text"
+    ],
+    "answer": "A. Option A text"
+  }},
+  // More questions...
+]
+```
+
+Ensure your response is valid JSON that can be parsed. Don't include any explanations outside the JSON structure.
+"""
+
+        return prompt
+
+    def _structure_questions(self, content: str) -> List[Dict[str, Any]]:
+        """
+        Разбирает сгенерированный контент с вопросами и преобразует его в структурированный список.
+
+        Args:
+            content: Сгенерированный текст с вопросами
+
+        Returns:
+            List[Dict[str, Any]]: Список словарей с вопросами и ответами
+        """
+        questions = []
+
+        try:
+            # Пытаемся найти и распарсить JSON в тексте
+            json_match = re.search(r'```json\s*(\[.*?\])\s*```', content, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(1)
+                return json.loads(json_str)
+
+            # Пытаемся найти JSON-массив в тексте
+            json_match = re.search(r'\[\s*{\s*"number".*?}\s*\]', content, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(0)
+                return json.loads(json_str)
+
+            # Если не нашли JSON в тексте, пробуем распарсить весь текст как JSON
+            try:
+                json_data = json.loads(content)
+                if isinstance(json_data, list) and len(json_data) > 0:
+                    return json_data
+            except:
+                pass
+
+            # Если не удалось распарсить как JSON, используем регулярные выражения
+
+            # Попробуем разные шаблоны для нахождения вопросов
+            patterns = [
+                # Формат "Question 1:" или "Вопрос 1:"
+                r'(?:Question|Вопрос)\s+(\d+)[:\.]',
+                # Формат "## Question 1" или "## Вопрос 1"
+                r'#{2,3}\s*(?:Question|Вопрос)\s+(\d+)[:\.]?',
+                # Формат "1. Question" или "1. Вопрос"
+                r'(\d+)[\.:\)]\s+(?:[A-Z]|[А-Я])',
+                # Формат "Exercise 1:" или "Упражнение 1:"
+                r'(?:Exercise|Упражнение)\s+(\d+)[:\.]'
+            ]
+
+            # Пробуем каждый шаблон по очереди
+            question_blocks = []
+            for pattern in patterns:
+                question_blocks = re.split(pattern, content)
+                # Если нашли хотя бы один вопрос, прерываем поиск
+                if len(question_blocks) > 2:
+                    break
+
+            if len(question_blocks) <= 1:
+                # Если не нашли вопросы по шаблонам, попробуем просто разбить по строкам
+                # и искать строки, начинающиеся с цифр
+                lines = content.split('\n')
+                current_question = None
+                current_options = []
+                current_block = ""
+
+                for line in lines:
+                    if re.match(r'^\d+\.?\s+', line):
+                        # Если нашли новый вопрос, сохраняем предыдущий
+                        if current_question:
+                            questions.append({
+                                "number": len(questions) + 1,
+                                "question": current_question,
+                                "options": current_options,
+                                "answer": None  # Ответ определим позже
+                            })
+                        # Начинаем новый вопрос
+                        current_question = re.sub(r'^\d+\.?\s+', '', line).strip()
+                        current_options = []
+                        current_block = line + "\n"
+                    elif re.match(r'^[A-D]\.?\s+', line) and current_question:
+                        # Нашли вариант ответа
+                        option_text = re.sub(r'^[A-D]\.?\s+', '', line).strip()
+                        current_options.append(option_text)
+                        current_block += line + "\n"
+                    elif current_question:
+                        # Продолжение текущего вопроса или блока
+                        current_block += line + "\n"
+
+                        # Проверяем, не ответ ли это
+                        if re.search(r'(?:Answer|Правильный ответ)[:\s]+([^\n\r]+)', line):
+                            answer_match = re.search(r'(?:Answer|Правильный ответ)[:\s]+([^\n\r]+)', line)
+                            if answer_match:
+                                questions[-1]["answer"] = answer_match.group(1).strip()
+
+                # Добавляем последний вопрос, если он есть
+                if current_question:
+                    questions.append({
+                        "number": len(questions) + 1,
+                        "question": current_question,
+                        "options": current_options,
+                        "answer": None
+                    })
+
+                # Проверяем на наличие ответов
+                for i, q in enumerate(questions):
+                    if not q["answer"]:
+                        # Пытаемся найти ответ в блоке текста
+                        answer_pattern = re.search(r'(?:Answer|Правильный ответ)[:\s]+([^\n\r]+)', current_block)
+                        if answer_pattern:
+                            questions[i]["answer"] = answer_pattern.group(1).strip()
+
+                return questions
+            else:
+                # Обрабатываем найденные блоки вопросов
+                question_number = 1
+                for i in range(1, len(question_blocks), 2):
+                    if i + 1 >= len(question_blocks):
+                        break
+
+                    number = int(question_blocks[i])
+                    block = question_blocks[i + 1].strip()
+
+                    # Извлекаем текст вопроса
+                    question_lines = block.split('\n')
+                    question_text = ""
+
+                    # Находим текст вопроса до вариантов ответов
+                    for line in question_lines:
+                        if re.match(r'^[A-D]\.', line.strip()) or "Options" in line or "Варианты ответов" in line:
+                            break
+                        question_text += line + " "
+
+                    question_text = question_text.strip()
+                    question_text = re.sub(r'^[:\s]+', '', question_text)
+
+                    # Извлекаем варианты ответов
+                    options = []
+                    options_pattern = r'(?:[A-D])[\.\:\)\s]+([^\n]+)'
+                    option_matches = re.findall(options_pattern, block)
+
+                    if option_matches:
+                        options = [opt.strip() for opt in option_matches]
+                    else:
+                        # Альтернативный поиск вариантов ответов
+                        options_section = re.search(r'(?:Options|Варианты ответов)[:\s]+(.*?)(?:(?:Correct )?Answer|Правильный ответ|$)', block, re.DOTALL)
+                        if options_section:
+                            options_text = options_section.group(1).strip()
+                            option_lines = re.findall(r'([A-D])[\.:\)\s]+([^\n\r]+)', options_text)
+                            options = [opt[1].strip() for opt in option_lines]
+
+                    # Извлекаем правильный ответ
+                    answer = None
+                    answer_match = re.search(r'(?:Answer|Правильный ответ)[:\s]+([^\n\r]+)', block, re.DOTALL)
+
+                    if answer_match:
+                        answer = answer_match.group(1).strip()
+
+                    if question_text:
+                        questions.append({
+                            "number": number,
+                            "question": question_text,
+                            "options": options,
+                            "answer": answer
+                        })
+                        question_number += 1
+
+                # Если ничего не нашли, возвращаем пустой список
+                return questions if questions else []
+
+        except Exception as e:
+            logger.error(f"Error structuring questions: {str(e)}")
+            return []
+
+    async def process_video_transcript(self, video_id: str, subtitle_language: str = "ru") -> str:
+        """Process video transcript for language learning"""
+        from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound
+        import re
+
+        logger.info(f"Обработка транскрипта для видео {video_id}")
+
+        # Extract YouTube ID from URL if a full URL was provided
+        video_id = self._extract_video_id(video_id)
+        if not video_id:
+            logger.error("Invalid YouTube video ID")
+            raise ValueError("Invalid YouTube video ID format")
+
+        # Check cache first without starting a new transaction
+        stmt = select(VideoTranscript).where(
+            VideoTranscript.video_id == video_id,
+            VideoTranscript.language == subtitle_language
+        )
+
+        result = await self.session.execute(stmt)
+        cached_transcript = result.scalar_one_or_none()
+
+        if cached_transcript:
+            logger.info(f"Найден кэшированный транскрипт для видео {video_id}")
+            return cached_transcript.transcript
+
+        try:
+            logger.info(f"Получение транскрипта YouTube для видео {video_id}")
+            transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=[subtitle_language])
+
+            if not transcript_list:
+                logger.warning(f"Не найден транскрипт для видео {video_id}")
+                return "Транскрипт недоступен для этого видео"
+
+            # Format transcript
+            formatted_transcript = ""
+            for item in transcript_list:
+                text = item['text']
+                start = item['start']
+                formatted_transcript += f"[{int(start//60):02d}:{int(start%60):02d}] {text}\n"
+
+            # Save to cache without using session.begin()
+            # Commit будет выполнен вызывающим кодом
+            transcript_record = VideoTranscript(
+                video_id=video_id,
+                language=subtitle_language,
+                transcript=formatted_transcript
+            )
+            self.session.add(transcript_record)
+
+            logger.info(f"Транскрипт успешно получен для видео {video_id}")
+            return formatted_transcript
+
+        except NoTranscriptFound:
+            logger.warning(f"Транскрипт не найден для видео {video_id} на языке {subtitle_language}")
+            return f"Транскрипт не найден для этого видео на языке {subtitle_language}"
+        except Exception as e:
+            logger.error(f"Ошибка при получении транскрипта: {str(e)}")
+            raise ValueError(f"Ошибка при получении транскрипта: {str(e)}")
+
+    def _extract_video_id(self, video_id_or_url: str) -> str:
+        """Extract YouTube video ID from URL or return as is if already an ID"""
+        import re
+
+        if not video_id_or_url:
+            return ""
+
+        # Check if it's already a video ID (typically 11 characters)
+        if re.match(r'^[A-Za-z0-9_-]{11}$', video_id_or_url):
+            return video_id_or_url
+
+        # Try to extract from URL
+        patterns = [
+            r'(?:youtube\.com\/watch\?v=|youtu.be\/)([A-Za-z0-9_-]{11})',
+            r'(?:youtube\.com\/embed\/)([A-Za-z0-9_-]{11})',
+            r'(?:youtube\.com\/v\/)([A-Za-z0-9_-]{11})'
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, video_id_or_url)
+            if match:
+                return match.group(1)
+
+        return video_id_or_url  # Return as is if no pattern matches
+
+    @memory_optimized()
+    async def generate_comprehension_test(
+        self,
+        text: str,
+        language: str,
+        question_count: int = 5,
+        difficulty: str = "medium",
+        **kwargs
+    ) -> str:
+        """
+        Генерирует вопросы к тексту
+
+        Args:
+            text (str): Текст, на основе которого генерируются вопросы
+            language (str): Язык текста
+            question_count (int): Количество вопросов
+            difficulty (str): Уровень сложности (easy, medium, hard)
+            **kwargs: Дополнительные параметры
+
+        Returns:
+            str: Сгенерированные вопросы к тексту в формате Markdown
+        """
+        try:
+            user_id = kwargs.get('user_id', 1)
+            logger.info(f"Generating comprehension questions with {question_count} questions for text in {language}, difficulty: {difficulty}")
+
+            # Проверяем параметры
+            if not 1 <= question_count <= 15:
+                raise ValidationError("Question count must be between 1 and 15")
+
+            if difficulty not in ["easy", "medium", "hard"]:
+                logger.warning(f"Unknown difficulty level: {difficulty}, using 'medium' as default")
+                difficulty = "medium"
+
+            # Создаем промпт для теста на понимание
+            prompt = self._create_comprehension_test_prompt(text, language, question_count, difficulty)
+
+            # Генерируем контент
+            content = await self.generate_content(
+                content_type=ContentType.TEXT_ANALYSIS,
+                prompt=prompt,
+                user_id=user_id,
+                extra_params={"difficulty": difficulty, "question_count": question_count}
+            )
+
+            # Заменяем заголовок "Тест на понимание текста" на "Вопросы по тексту"
+            is_russian = language.lower() in ["russian", "русский", "ru"]
+
+            if is_russian:
+                content = content.replace("# Тест на понимание текста", "# Вопросы по тексту")
+                content = content.replace("## Тест на понимание текста", "# Вопросы по тексту")
+            else:
+                content = content.replace("# Reading Comprehension Test", "# Text Questions")
+                content = content.replace("## Reading Comprehension Test", "# Text Questions")
+
+            # Обрабатываем экранированные символы
+            content = content.replace("\\n", "\n").replace("\\\\", "\\")
+
+            # Возвращаем сгенерированный тест
+            return content
+
+        except Exception as e:
+            logger.error(f"Error generating comprehension test: {str(e)}")
+            raise
+
+    def _create_comprehension_test_prompt(self, text: str, language: str, question_count: int, difficulty: str) -> str:
+        """Создает промпт для теста на понимание текста"""
+
+        difficulty_descriptions = {
+            "easy": "basic comprehension questions suitable for beginners",
+            "medium": "moderate difficulty questions requiring good understanding",
+            "hard": "challenging questions requiring deep analysis and inference"
+        }
+
+        diff_description = difficulty_descriptions.get(difficulty, "moderate difficulty questions")
+
+        # Определяем языковые параметры на основе указанного языка
+        language_codes = {
+            "english": {"code": "en", "native": "English"},
+            "spanish": {"code": "es", "native": "Español"},
+            "french": {"code": "fr", "native": "Français"},
+            "german": {"code": "de", "native": "Deutsch"},
+            "italian": {"code": "it", "native": "Italiano"},
+            "chinese": {"code": "zh", "native": "中文"},
+            "japanese": {"code": "ja", "native": "日本語"},
+            "korean": {"code": "ko", "native": "한국어"},
+            "turkish": {"code": "tr", "native": "Türkçe"},
+            "russian": {"code": "ru", "native": "Русский"},
+            "arabic": {"code": "ar", "native": "العربية"}
+        }
+
+        language_info = language_codes.get(language.lower(), {"code": "en", "native": "English"})
+        language_code = language_info["code"]
+        language_native = language_info["native"]
+
+        # Определяем, является ли язык русским для особого форматирования
+        is_russian = language.lower() in ["russian", "русский", "ru"]
+        title = "Вопросы по тексту" if is_russian else "Text Questions"
+
+        # Создаем промпт по структуре CARE (Context, Ask, Rules, Examples)
+        prompt = f"""
+# RESPOND ONLY IN {language_native.upper()} ({language_code})
+
+# CONTEXT:
+I am working with a text in {language_native} that contains approximately {len(text.split())} words.
+The text begins with: {text[:100]}...
+The difficulty level requested is: {difficulty} ({diff_description})
+
+# ASK:
+Create {question_count} multiple-choice questions based on the provided text. The questions should help assess comprehension of the text.
+
+# IMPORTANT LANGUAGE INSTRUCTION:
+- The content MUST be created in {language_native} language ({language_code})
+- All questions, options, and answers MUST be written in {language_native}
+- The title should be "{title}"
+- All content must be formatted in Markdown
+- DO NOT translate any part of the text or questions into any other language
+- Use ONLY {language_native} for ALL content including titles, questions, options, and explanations
+
+# RULES:
+- Start with a main heading: "# {title}"
+- Each question must be clearly numbered and formatted with a colored number using this exact format:
+  "Вопрос 1:" for Russian or "Question 1:" for other languages
+- Use exactly 4 options (A, B, C, D) for each question
+- For each question's options, format them like this:
+  A. First option
+  B. Second option
+  C. Third option
+  D. Fourth option
+- Mark the correct answer with a ✓ symbol at the beginning of the line
+- After the options, include a section titled "Правильный ответ:" for Russian or "Correct Answer:" for other languages that shows the correct option
+- Add a separator "---" between questions
+- All questions and answers must be based solely on the text content
+- Questions should be challenging but fair at the {difficulty} level
+- Ensure all formatting is consistent throughout
+
+# EXAMPLE FORMAT (in Russian):
+# Вопросы по тексту
+
+Вопрос 1: [Text of the question]
+
+Варианты ответов:
+
+A. Option one
+B. Option two
+C. ✓ Correct option
+D. Option four
+
+Правильный ответ: C. ✓ Correct option
+
+---
+
+Вопрос 2: [Text of the second question]
+...
+
+# THE TEXT:
+{text}
+
+Now create well-structured multiple-choice questions based on this text in {language_native} language following the exact format specified.
+"""
+
+        return prompt
+
+    @memory_optimized()
+    async def generate_titles(
+        self,
+        text: str,
+        language: str,
+        count: int = 4,
+        **kwargs
+    ) -> TitlesAnalysis:
+        """
+        Генерирует заголовки для текста
+
+        Args:
+            text (str): Текст, для которого генерируются заголовки
+            language (str): Язык текста
+            count (int): Количество заголовков для генерации
+            **kwargs: Дополнительные параметры
+
+        Returns:
+            TitlesAnalysis: Объект с заголовками и индексом рекомендуемого заголовка
+        """
+        try:
+            user_id = kwargs.get('user_id', 1)
+            logger.info(f"Generating {count} titles for text in {language}")
+
+            # Проверяем параметры
+            if not 1 <= count <= 10:
+                raise ValidationError("Title count must be between 1 and 10")
+
+            # Создаем промпт для генерации заголовков
+            prompt = self._create_titles_prompt(text, language, count)
+
+            # Генерируем контент
+            content = await self.generate_content(
+                content_type=ContentType.TEXT_ANALYSIS,
+                prompt=prompt,
+                user_id=user_id,
+                extra_params={"count": count, "action": "generate_titles"}
+            )
+
+            # Парсим результат и извлекаем заголовки
+            titles_data = self._parse_titles_from_content(content)
+            titles = titles_data["titles"]
+            recommended_index = titles_data["recommended_index"]
+
+            # Убеждаемся, что у нас есть правильное количество заголовков
+            if len(titles) < count:
+                logger.warning(f"Received fewer titles than requested ({len(titles)} < {count}), filling with placeholders")
+                # Добавляем плейсхолдеры, если получили меньше заголовков, чем запрошено
+                titles.extend([f"Title {i+1}" for i in range(len(titles), count)])
+            elif len(titles) > count:
+                logger.warning(f"Received more titles than requested ({len(titles)} > {count}), truncating")
+                titles = titles[:count]
+                # Корректируем индекс рекомендуемого заголовка, если он выходит за границы
+                if recommended_index >= count:
+                    recommended_index = 0
+
+            # Возвращаем объект TitlesAnalysis
+            return TitlesAnalysis(
+                titles=titles,
+                recommended_index=recommended_index
+            )
+
+        except Exception as e:
+            logger.error(f"Error generating titles: {str(e)}")
+            raise
+
+    def _create_titles_prompt(self, text: str, language: str, count: int) -> str:
+        """Создает промпт для генерации заголовков"""
+
+        # Определяем языковые параметры на основе указанного языка
+        language_codes = {
+            "english": {"code": "en", "native": "English"},
+            "spanish": {"code": "es", "native": "Español"},
+            "french": {"code": "fr", "native": "Français"},
+            "german": {"code": "de", "native": "Deutsch"},
+            "italian": {"code": "it", "native": "Italiano"},
+            "chinese": {"code": "zh", "native": "中文"},
+            "japanese": {"code": "ja", "native": "日本語"},
+            "korean": {"code": "ko", "native": "한국어"},
+            "turkish": {"code": "tr", "native": "Türkçe"},
+            "russian": {"code": "ru", "native": "Русский"},
+            "arabic": {"code": "ar", "native": "العربية"}
+        }
+
+        language_info = language_codes.get(language.lower(), {"code": "en", "native": "English"})
+        language_code = language_info["code"]
+        language_native = language_info["native"]
+
+        # Формируем промпт для генерации заголовков
+        prompt = f"""
+# RESPOND ONLY IN {language_native.upper()} ({language_code})
+
+# CONTEXT:
+I have a text in {language_native} that contains approximately {len(text.split())} words.
+The text begins with: {text[:100]}...
+
+# ASK:
+Generate {count} distinct and creative titles for this text.
+
+# IMPORTANT LANGUAGE INSTRUCTION:
+- The titles MUST be created in {language_native} language ({language_code})
+- DO NOT translate titles into any other language
+- Use ONLY {language_native} for ALL titles
+
+# RULES:
+- Create exactly {count} titles
+- One of the titles MUST be accurate and directly relevant to the text content
+- Titles should be catchy, engaging, and appropriate for the text
+- Titles should be concise (typically 3-10 words)
+- Titles should vary in style (e.g., question, statement, metaphorical)
+- Each title should be unique and different from the others
+- Number each title in the format: "1. [Title text]"
+- Mark the most accurate and relevant title with a ✓ symbol at the end
+- Do not include quotes or extra formatting around the titles
+
+# EXAMPLE OUTPUT:
+1. The Surprising Benefits of Daily Exercise ✓
+2. From Couch to Marathon: A Journey of Transformation
+3. Your Body's Hidden Potential: Unlock It Through Movement
+4. Exercise: The Free Medicine That Changes Lives
+
+# FINAL REMINDER:
+You MUST create ALL titles in {language_native} language ONLY.
+Don't forget to mark the most accurate and relevant title with a ✓ symbol.
+
+# THE TEXT:
+{text}
+
+Now generate {count} unique and engaging titles for this text.
+"""
+
+        return prompt
+
+    def _parse_titles_from_content(self, content: str) -> dict:
+        """Извлекает заголовки из сгенерированного контента"""
+        titles = []
+        recommended_index = -1  # Индекс рекомендуемого заголовка
+
+        # Ищем строки, начинающиеся с числа и точки, за которым следует текст
+        pattern = r'^\s*(\d+)\.?\s*(.+?)(\s*✓)?\s*$'
+
+        for line in content.split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+
+            match = re.match(pattern, line)
+            if match:
+                title_number = int(match.group(1)) - 1  # Индекс с нуля
+                title_text = match.group(2).strip()
+                is_recommended = bool(match.group(3))
+
+                # Добавляем заголовок в список
+                titles.append(title_text)
+
+                # Если это рекомендуемый заголовок, запоминаем его индекс
+                if is_recommended:
+                    recommended_index = title_number
+
+        # Если не удалось найти заголовки в нужном формате, пробуем другой подход
+        if not titles:
+            # Разделяем по пустым строкам и берем первые строки каждого раздела
+            sections = [s.strip() for s in content.split('\n\n')]
+            for section in sections:
+                if section and not section.startswith('#'):
+                    lines = section.split('\n')
+                    for line in lines:
+                        line = line.strip()
+                        # Ищем символ рекомендованного заголовка
+                        is_recommended = '✓' in line
+                        if is_recommended:
+                            recommended_index = len(titles)  # Этот заголовок будет рекомендуемым
+
+                        # Удаляем метку из заголовка
+                        clean_line = line.replace('✓', '').strip()
+
+                        if clean_line and len(clean_line) <= 100:  # Разумное ограничение для заголовка
+                            titles.append(clean_line)
+                            break
+
+        # Если рекомендуемый заголовок не был явно указан, выбираем первый
+        if recommended_index == -1 and titles:
+            recommended_index = 0
+
+        # Убедимся, что индекс рекомендуемого заголовка в допустимом диапазоне
+        if recommended_index >= len(titles):
+            recommended_index = 0 if titles else -1
+
+        # Возвращаем заголовки и информацию о рекомендуемом
+        return {
+            "titles": titles,
+            "recommended_index": recommended_index
+        }
+
+    @memory_optimized()
+    async def summarize_text(
+        self,
+        text: str,
+        max_length: int = None,
+        level: str = None,
+        **kwargs
+    ) -> str:
+        """
+        Генерирует саммари текста
+
+        Args:
+            text (str): Текст, для которого генерируется саммари
+            max_length (int, optional): Максимальная длина саммари в словах
+            level (str, optional): Уровень владения языком (a1, a2, b1, b2, c1, c2, etc.)
+            **kwargs: Дополнительные параметры
+
+        Returns:
+            str: Сгенерированное саммари
+        """
+        try:
+            user_id = kwargs.get('user_id', 1)
+            language = kwargs.get('language', 'russian')
+
+            # Карта соответствия уровней и длины саммари
+            level_to_length = {
+                # CEFR для европейских языков
+                'a1': 50,    # Начальный - очень короткое, простое саммари
+                'a2': 75,    # Элементарный - короткое, простое саммари
+                'b1': 150,   # Средний - среднее по длине, базовые конструкции
+                'b2': 200,   # Средне-продвинутый - умеренно длинное
+                'c1': 300,   # Продвинутый - длинное, детализированное
+                'c2': 400,   # Свободное владение - очень детальное и длинное
+
+                # HSK для китайского
+                'hsk1': 50,
+                'hsk2': 75,
+                'hsk3': 125,
+                'hsk4': 200,
+                'hsk5': 300,
+                'hsk6': 400,
+                'hsk7-9': 450,
+
+                # JLPT для японского
+                'n5': 50,
+                'n4': 100,
+                'n3': 200,
+                'n4': 300,
+                'n1': 450,
+
+                # TOPIK для корейского
+                'topik1': 50,
+                'topik2': 100,
+                'topik3': 150,
+                'topik4': 250,
+                'topik5': 350,
+                'topik6': 450,
+
+                # Для русского (ТРКИ)
+                'tea': 50,
+                'tba': 100,
+                't1': 200,
+                't2': 300,
+                't3': 400,
+                't4': 450,
+
+                # Для арабского (общие уровни)
+                'beginner': 50,
+                'elementary': 100,
+                'intermediate': 200,
+                'advanced': 300,
+                'superior': 400,
+                'native': 450
+            }
+
+            # Если указан уровень, определяем длину на его основе
+            if level and level.lower() in level_to_length:
+                actual_max_length = level_to_length[level.lower()]
+                logger.info(f"Using level '{level}' to determine max_length: {actual_max_length}")
+            elif max_length is not None:
+                # Если указана точная длина, используем её
+                actual_max_length = max_length
+            # Проверяем параметры
+                if not 50 <= actual_max_length <= 500:
+                    logger.warning(f"Invalid max_length: {actual_max_length}, using default of 200")
+                    actual_max_length = 200
+            else:
+                # По умолчанию используем средний уровень
+                logger.warning("Neither level nor max_length specified, using default max_length of 200")
+                actual_max_length = 200
+
+            logger.info(f"Generating summary with max length {actual_max_length} for text of length {len(text)}")
+
+            # Создаем промпт для генерации саммари
+            prompt = self._create_summary_prompt(text, language, actual_max_length, level)
+
+            # Генерируем контент
+            content = await self.generate_content(
+                content_type=ContentType.TEXT_ANALYSIS,
+                prompt=prompt,
+                user_id=user_id,
+                extra_params={"max_length": actual_max_length, "level": level}
+            )
+
+            return content
+
+        except Exception as e:
+            logger.error(f"Error generating summary: {str(e)}")
+            raise
+
+    def _create_summary_prompt(self, text: str, language: str, max_length: int, level: str = None) -> str:
+        """Создает промпт для генерации саммари"""
+
+        # Определяем языковые параметры на основе указанного языка
+        language_codes = {
+            "english": {"code": "en", "native": "English"},
+            "spanish": {"code": "es", "native": "Español"},
+            "french": {"code": "fr", "native": "Français"},
+            "german": {"code": "de", "native": "Deutsch"},
+            "italian": {"code": "it", "native": "Italiano"},
+            "chinese": {"code": "zh", "native": "中文"},
+            "japanese": {"code": "ja", "native": "日本語"},
+            "korean": {"code": "ko", "native": "한국어"},
+            "turkish": {"code": "tr", "native": "Türkçe"},
+            "russian": {"code": "ru", "native": "Русский"},
+            "arabic": {"code": "ar", "native": "العربية"}
+        }
+
+        language_info = language_codes.get(language.lower(), {"code": "en", "native": "English"})
+        language_code = language_info["code"]
+        language_native = language_info["native"]
+
+        # Добавляем инструкции в соответствии с уровнем
+        level_instructions = ""
+        if level:
+            if level.lower().startswith('a'):
+                level_instructions = f"""
+# LANGUAGE LEVEL INSTRUCTIONS (Level {level.upper()}):
+- Use very simple vocabulary appropriate for beginner level
+- Use short, simple sentences with basic grammar structures
+- Avoid complex sentences, idioms, and advanced expressions
+- Focus on the most basic and essential information only
+- Use common words and phrases that beginners would understand
+- Use present tense predominantly, minimizing complex verb forms
+"""
+            elif level.lower().startswith('b'):
+                level_instructions = f"""
+# LANGUAGE LEVEL INSTRUCTIONS (Level {level.upper()}):
+- Use vocabulary appropriate for intermediate level
+- Use a mix of simple and some compound sentences
+- Include some common expressions and idioms, but avoid very advanced ones
+- Provide a more detailed overview with moderate complexity
+- Use a variety of tenses, but limit very complex grammatical structures
+"""
+            elif level.lower().startswith('c') or level.lower() in ['native', 'superior', 't3', 't4', 'hsk6', 'hsk7-9', 'n1']:
+                level_instructions = f"""
+# LANGUAGE LEVEL INSTRUCTIONS (Level {level.upper()}):
+- Use rich, varied vocabulary appropriate for advanced level
+- Use complex sentence structures, including compound and complex sentences
+- Include idiomatic expressions, specialized terminology, and nuanced language
+- Provide detailed information with significant depth and complexity
+- Use a full range of grammatical structures, including advanced ones
+- Demonstrate sophisticated language comparable to educated native usage
+"""
+            else:
+                # Промежуточные уровни или уровни для других языковых систем
+                level_instructions = f"""
+# LANGUAGE LEVEL INSTRUCTIONS (Level {level.upper()}):
+- Adapt vocabulary and grammar to the specified level ({level})
+- Balance simplicity and complexity appropriate for this level
+- Use language structures commonly taught at this level
+- Ensure the summary is challenging but comprehensible for learners at this level
+"""
+
+        # Формируем промпт для генерации саммари
+        prompt = f"""
+# RESPOND ONLY IN {language_native.upper()} ({language_code})
+
+# CONTEXT:
+I have a text in {language_native} that contains approximately {len(text.split())} words.
+I need a summary with EXACTLY AND PRECISELY {max_length} words - NOT LESS, NOT MORE.
+This is a STRICT REQUIREMENT - the summary MUST contain {max_length} words.
+
+{level_instructions}
+
+# ASK:
+Create a detailed summary of the provided text using EXACTLY {max_length} words.
+DO NOT create a summary shorter than {max_length} words under any circumstances.
+IF your summary is shorter than {max_length} words, add more details from the original text to reach EXACTLY {max_length} words.
+
+# IMPORTANT LANGUAGE INSTRUCTION:
+- The summary MUST be created in {language_native} language ({language_code})
+- DO NOT translate the summary into any other language
+- Use ONLY {language_native} for ALL content
+- The summary must be in plain text format
+
+# RULES:
+- Your summary MUST contain EXACTLY {max_length} words (±1 word maximum deviation)
+- Count each word carefully during writing
+- Capture the main ideas, key points, AND sufficient details from the original text
+- Include enough details to REACH the {max_length} word count - this is MANDATORY
+- DO NOT make the summary shorter than {max_length} words
+- Maintain the original meaning and intent of the text
+- Organize the summary in a logical flow
+- Do not include your own opinions or interpretations
+- Do not add information that is not present in the original text
+- If the summary is approaching {max_length} words, adjust detail level to meet exact count
+
+# WORD COUNTING METHODOLOGY:
+1. Split the text by spaces to count words
+2. Before submitting, count the total words in your summary
+3. If the count is less than {max_length}, add more details until you reach EXACTLY {max_length} words
+4. If the count is more than {max_length}, remove minor details until you reach EXACTLY {max_length} words
+
+# FINAL REMINDER:
+You MUST create the summary in {language_native} language ONLY.
+The summary MUST contain EXACTLY {max_length} words - not fewer, not more.
+Double-check your word count before submitting.
+
+# THE TEXT:
+{text}
+
+Now generate a summary of this text with EXACTLY {max_length} words. Before submitting your answer, count the words to verify it is EXACTLY {max_length} words.
+"""
+
+        return prompt
+
+    @memory_optimized()
+    async def generate_summaries(
+        self,
+        text: str,
+        language: str = "russian",
+        **kwargs
+    ) -> str:
+        """
+        Генерирует три варианта саммари разной длины для текста
+
+        Args:
+            text (str): Текст, для которого генерируются саммари
+            language (str): Язык текста
+            **kwargs: Дополнительные параметры
+
+        Returns:
+            str: Сгенерированные саммари в формате Markdown
+        """
+        try:
+            user_id = kwargs.get('user_id', 1)
+            logger.info(f"Generating three summaries of different lengths for text in {language}")
+
+            # Создаем промпт для генерации саммари разной длины
+            prompt = self._create_multiple_summaries_prompt(text, language)
+
+            # Генерируем контент
+            content = await self.generate_content(
+                content_type=ContentType.TEXT_ANALYSIS,
+                prompt=prompt,
+                user_id=user_id
+            )
+
+            return content
+
+        except Exception as e:
+            logger.error(f"Error generating multiple summaries: {str(e)}")
+            raise
+
+    def _create_multiple_summaries_prompt(self, text: str, language: str) -> str:
+        """Создает промпт для генерации нескольких саммари разной длины"""
+
+        # Определяем языковые параметры на основе указанного языка
+        language_codes = {
+            "english": {"code": "en", "native": "English"},
+            "spanish": {"code": "es", "native": "Español"},
+            "french": {"code": "fr", "native": "Français"},
+            "german": {"code": "de", "native": "Deutsch"},
+            "italian": {"code": "it", "native": "Italiano"},
+            "chinese": {"code": "zh", "native": "中文"},
+            "japanese": {"code": "ja", "native": "日本語"},
+            "korean": {"code": "ko", "native": "한국어"},
+            "turkish": {"code": "tr", "native": "Türkçe"},
+            "russian": {"code": "ru", "native": "Русский"},
+            "arabic": {"code": "ar", "native": "العربية"}
+        }
+
+        language_info = language_codes.get(language.lower(), {"code": "en", "native": "English"})
+        language_code = language_info["code"]
+        language_native = language_info["native"]
+
+        # Формируем промпт для генерации нескольких саммари
+        prompt = f"""
+# RESPOND ONLY IN {language_native.upper()} ({language_code})
+
+# CONTEXT:
+I am working with a text in {language_native} that contains approximately {len(text.split())} words and {len(text.split('.')) + len(text.split('!')) + len(text.split('?')) - 2} sentences.
+The text begins with: {text[:100]}...
+
+# ASK:
+Create three different summaries of the text at different levels of detail:
+1. Brief summary (1-2 sentences)
+2. Medium summary (3-5 sentences)
+3. Detailed summary (6-10 sentences)
+
+# IMPORTANT LANGUAGE INSTRUCTION:
+- The summaries MUST be created in {language_native} language ({language_code})
+- DO NOT translate into any other language
+- Use ONLY {language_native} for ALL content including titles and summaries
+- Format the response in Markdown with clear headings for each summary type
+
+# RULES:
+- Each summary must accurately reflect the main content of the text
+- The brief summary should capture only the most essential information
+- The medium summary should include main ideas and key supporting details
+- The detailed summary should cover all major aspects of the text, including important details
+- Maintain the logical structure and flow of the original text
+- Use your own wording rather than copying sentences directly from the original
+- Do not add information that is not present in the original text
+- Format the response in Markdown with clear headings for each summary type
+- Ensure that each summary is coherent and stands on its own
+
+# EXAMPLE OUTPUT:
+# Резюме текста
+
+## Краткое резюме (1-2 предложения):
+Текст рассматривает влияние социальных сетей на современное общество, выделяя как положительные аспекты в виде расширения коммуникационных возможностей, так и отрицательные последствия в форме зависимости и ухудшения психического здоровья.
+
+## Среднее резюме (3-5 предложений):
+Текст анализирует двойственное влияние социальных сетей на общество. С одной стороны, они расширяют возможности коммуникации, облегчают доступ к информации и способствуют формированию новых сообществ по интересам. С другой стороны, автор отмечает растущую проблему цифровой зависимости, ухудшение психического здоровья пользователей и распространение недостоверной информации. В заключение предлагаются меры по более осознанному использованию социальных платформ.
+
+## Подробное резюме (6-10 предложений):
+Текст посвящен комплексному анализу роли социальных сетей в современном обществе. Автор начинает с исторического обзора развития социальных платформ от простых форумов до сложных экосистем. Далее подробно рассматриваются положительные аспекты: беспрецедентные возможности для коммуникации вне географических границ, демократизация доступа к информации, возможности для самовыражения и формирование сообществ по интересам. В противовес этому анализируются негативные последствия: рост цифровой зависимости, документально подтвержденное ухудшение психического здоровья подростков, проблемы конфиденциальности и распространение дезинформации. Особое внимание уделяется феномену "эхо-камер", усиливающих поляризацию общества. Автор приводит данные исследований, демонстрирующих корреляцию между временем, проведенным в социальных сетях, и уровнем тревожности. В заключение предлагаются рекомендации по более сбалансированному использованию социальных платформ, включая "цифровую гигиену" и развитие критического мышления.
+
+# FINAL REMINDER:
+You MUST create ALL summaries in {language_native} language ONLY.
+Format the response with proper Markdown headings and sections.
+
+# THE TEXT:
+{text}
+
+Now create three well-structured summaries at different levels of detail for this text.
+"""
+
+        return prompt
+
+    @memory_optimized()
+    async def detect_text_level(
+        self,
+        text: str,
+        language: str,
+        **kwargs
+    ) -> TextLevelAnalysis:
+        """
+        Определение уровня сложности текста
+
+        Args:
+            text (str): Текст для анализа
+            language (str): Язык текста
+            **kwargs: Дополнительные параметры
+
+        Returns:
+            TextLevelAnalysis: Результат анализа, содержащий как markdown_content, так и level
+        """
+        try:
+            import json
+            import re
+
+            user_id = kwargs.get('user_id', 1)
+
+            # Определяем систему уровней в зависимости от языка
+            language_system = {
+                "english": "CEFR (A1-C2)",
+                "spanish": "CEFR (A1-C2)",
+                "french": "CEFR (A1-C2)",
+                "german": "CEFR (A1-C2)",
+                "italian": "CEFR (A1-C2)",
+                "turkish": "CEFR (A1-C2)",
+                "chinese": "HSK (1-6)",
+                "japanese": "JLPT (N5-N1)",
+                "korean": "TOPIK (1-6)",
+                "russian": "ТРКИ (ТЭУ-ТРКИ-4)",
+                "arabic": "ACTFL (Beginner-Superior)"
+            }
+
+            level_system = language_system.get(language.lower(), "CEFR (A1-C2)")
+
+            logger.info(f"Analyzing text level using {level_system} for language: {language}")
+
+            # Создаем промпт для определения уровня текста
+            prompt = self._create_text_level_prompt(text, language, level_system)
+
+            # Генерируем контент
+            json_response = await self.generate_content(
+                content_type=ContentType.TEXT_ANALYSIS,
+                prompt=prompt,
+                user_id=user_id,
+                extra_params={"action": "detect_text_level"}
+            )
+
+            logger.info(f"Received text level analysis JSON (length: {len(json_response)})")
+
+            # Пытаемся извлечь JSON из ответа
+            try:
+                # Если в ответе есть код JSON, удаляем его обертку
+                json_match = re.search(r'```(?:json)?\s*(.*?)\s*```', json_response, re.DOTALL)
+                if json_match:
+                    json_str = json_match.group(1)
+                else:
+                    json_str = json_response
+
+                # Парсим JSON
+                analysis_data = json.loads(json_str)
+
+                # Проверяем наличие всех необходимых полей
+                required_fields = ["level", "explanation", "vocabulary_analysis", "grammar_analysis", "sentence_structure", "recommendations"]
+                for field in required_fields:
+                    if field not in analysis_data:
+                        analysis_data[field] = f"[Отсутствует информация о {field}]"
+
+                # Создаем форматированный Markdown
+                markdown_content = f"""
+# Анализ уровня текста
+
+## Уровень: {analysis_data["level"]}
+
+## Объяснение
+{analysis_data["explanation"]}
+
+## Анализ словарного запаса
+{analysis_data["vocabulary_analysis"]}
+
+## Анализ грамматики
+{analysis_data["grammar_analysis"]}
+
+## Структура предложений
+{analysis_data["sentence_structure"]}
+
+## Рекомендации
+{analysis_data["recommendations"]}
+"""
+
+                return TextLevelAnalysis(
+                    markdown_content=markdown_content,
+                    level=analysis_data["level"],
+                    raw_analysis=analysis_data
+                )
+
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse JSON response: {str(e)}")
+                # Если не удалось распарсить JSON, возвращаем исходный ответ
+                return TextLevelAnalysis(
+                    markdown_content=f"## Ошибка парсинга JSON\n\nПолученный ответ не является корректным JSON:\n\n```\n{json_response}\n```",
+                    level="Unknown",
+                    raw_analysis={"raw_response": json_response}
+                )
+
+        except Exception as e:
+            logger.error(f"Error detecting text level: {str(e)}")
+            raise
+
+    def _create_text_level_prompt(self, text: str, language: str, level_system: str) -> str:
+        """Создает промпт для определения уровня текста"""
+
+        # Определяем языковые параметры на основе указанного языка
+        language_codes = {
+            "english": {"code": "en", "native": "English"},
+            "spanish": {"code": "es", "native": "Español"},
+            "french": {"code": "fr", "native": "Français"},
+            "german": {"code": "de", "native": "Deutsch"},
+            "italian": {"code": "it", "native": "Italiano"},
+            "chinese": {"code": "zh", "native": "中文"},
+            "japanese": {"code": "ja", "native": "日本語"},
+            "korean": {"code": "ko", "native": "한국어"},
+            "turkish": {"code": "tr", "native": "Türkçe"},
+            "russian": {"code": "ru", "native": "Русский"},
+            "arabic": {"code": "ar", "native": "العربية"}
+        }
+
+        language_info = language_codes.get(language.lower(), {"code": "en", "native": "English"})
+        language_code = language_info["code"]
+        language_native = language_info["native"]
+
+        # Определяем критерии оценки уровня для разных систем
+        if "CEFR" in level_system:
+            level_criteria = """
+- A1 (Beginner): Can understand and use familiar everyday expressions and very basic phrases. Can introduce him/herself and others.
+- A2 (Elementary): Can understand sentences and frequently used expressions related to areas of most immediate relevance.
+- B1 (Intermediate): Can deal with most situations likely to arise while traveling in an area where the language is spoken.
+- B2 (Upper Intermediate): Can interact with a degree of fluency and spontaneity that makes regular interaction with native speakers quite possible.
+- C1 (Advanced): Can express ideas fluently and spontaneously without much obvious searching for expressions.
+- C2 (Proficiency): Can understand with ease virtually everything heard or read. Can express him/herself spontaneously, very fluently and precisely.
+"""
+            valid_levels = ["A1", "A2", "B1", "B2", "C1", "C2"]
+        elif "HSK" in level_system:
+            level_criteria = """
+- HSK 1: Can understand and use very simple Chinese phrases.
+- HSK 2: Can communicate in simple and routine tasks requiring a simple and direct exchange of information.
+- HSK 3: Can handle most situations likely to arise whilst traveling in Chinese-speaking regions.
+- HSK 4: Can interact with a degree of fluency and spontaneity with Chinese speakers.
+- HSK 5: Can express ideas fluently without much difficulty with native Chinese speakers.
+- HSK 6: Can express themselves fluently and precisely in complex situations in Chinese.
+"""
+            valid_levels = ["HSK1", "HSK2", "HSK3", "HSK4", "HSK5", "HSK6"]
+        elif "JLPT" in level_system:
+            level_criteria = """
+- N5: Can understand basic Japanese.
+- N4: Can understand basic Japanese used in daily situations to a certain degree.
+- N3: Can understand Japanese used in everyday situations to a certain degree.
+- N2: Can understand Japanese used in everyday situations and in a variety of circumstances.
+- N1: Can understand Japanese used in a wide range of circumstances.
+"""
+            valid_levels = ["N5", "N4", "N3", "N2", "N1"]
+        elif "TOPIK" in level_system:
+            level_criteria = """
+- TOPIK 1: Can understand and use familiar everyday expressions in Korean.
+- TOPIK 2: Can communicate in simple and routine tasks in Korean.
+- TOPIK 3: Can handle most situations in Korean.
+- TOPIK 4: Can express ideas with fluency in Korean.
+- TOPIK 5: Can express ideas with high fluency in Korean.
+- TOPIK 6: Can express ideas with native-like fluency in Korean.
+"""
+            valid_levels = ["TOPIK1", "TOPIK2", "TOPIK3", "TOPIK4", "TOPIK5", "TOPIK6"]
+        elif "ТРКИ" in level_system:
+            level_criteria = """
+- ТЭУ (A1): Базовое владение русским языком для минимального общения.
+- ТБУ (A2): Базовый уровень владения для ограниченного повседневного общения.
+- ТРКИ-1 (B1): Средний уровень для достаточного общения в бытовой и социально-культурной сферах.
+- ТРКИ-2 (B2): Уровень, необходимый для обучения и работы по нелингвистическим специальностям.
+- ТРКИ-3 (C1): Уровень, достаточный для профессиональной деятельности на русском языке.
+- ТРКИ-4 (C2): Свободное владение русским языком близкое к уровню носителя языка.
+"""
+            valid_levels = ["ТЭУ", "ТБУ", "ТРКИ-1", "ТРКИ-2", "ТРКИ-3", "ТРКИ-4"]
+        else:
+            level_criteria = """
+- Beginner: Can understand and use very basic phrases.
+- Elementary: Can communicate in simple and routine tasks.
+- Intermediate: Can handle most situations in everyday life.
+- Upper Intermediate: Can interact with a degree of fluency.
+- Advanced: Can express ideas fluently and spontaneously.
+- Proficient: Can understand virtually everything heard or read.
+"""
+            valid_levels = ["Beginner", "Elementary", "Intermediate", "Upper Intermediate", "Advanced", "Proficient"]
+
+        # Формируем промпт для определения уровня текста
+        prompt = f"""
+# TASK: ANALYZE TEXT LEVEL
+
+# CONTEXT:
+I need a detailed analysis of the level of a text in {language_native}.
+The text contains approximately {len(text.split())} words.
+Please use the {level_system} scale for your analysis.
+
+# LEVEL CRITERIA:
+{level_criteria}
+
+# OUTPUT REQUIREMENTS:
+1. You MUST return your analysis as a JSON object with the following fields:
+   - "level": The exact level from {valid_levels}
+   - "explanation": Detailed explanation in {language_native} why you determined this level
+   - "vocabulary_analysis": Assessment of vocabulary level
+   - "grammar_analysis": Assessment of grammar complexity
+   - "sentence_structure": Assessment of sentence complexity
+   - "recommendations": Suggestions for readers at different levels
+
+2. The "level" field MUST be exactly one of these values: {valid_levels}
+3. Do not include any text before or after the JSON object
+4. Make sure the JSON is properly formatted and can be parsed
+
+# IMPORTANT LANGUAGE INSTRUCTION:
+- The explanation and all analysis fields MUST be written in {language_native} language ({language_code})
+- Only the JSON field names should be in English
+- DO NOT translate your analysis into any other language
+- Use ONLY {language_native} for all content values
+
+# THE TEXT TO ANALYZE:
+{text}
+
+Now analyze this text and determine its language level according to the {level_system} scale.
+Return ONLY a well-formatted JSON object as specified.
+"""
+
+        return prompt
+
+    @memory_optimized()
+    async def change_text_level(
+        self,
+        text: str,
+        language: str,
+        target_level: str,
+        preserve_style: bool = True,
+        **kwargs
+    ) -> str:
+        """
+        Изменение уровня сложности текста
+
+        Args:
+            text (str): Исходный текст
+            language (str): Язык текста
+            target_level (str): Целевой уровень (A1, A2, B1, B2, C1, C2, ...)
+            preserve_style (bool): Сохранять ли оригинальный стиль текста
+            **kwargs: Дополнительные параметры
+
+        Returns:
+            str: Адаптированный текст
+        """
+        try:
+            user_id = kwargs.get('user_id', 1)
+
+            logger.info(f"Changing text level to {target_level} for {language} text (preserve_style={preserve_style})")
+
+            # Создаем данные для промпта
+            prompt_data = {
+                'text_content': text,
+                'language': language,
+                'target_level': target_level,
+                'preserve_style': preserve_style
+            }
+
+            # Используем функцию форматирования промпта из api/v1/content.py
+            # Но так как она находится в другом модуле, создаем промпт непосредственно здесь
+
+            # Инструкции для сохранения стиля
+            preserve_style_instructions = ""
+            if preserve_style:
+                preserve_style_instructions = """
+                IMPORTANT: Preserve the original style, tone, and structure of the text as much as possible.
+                Keep the same paragraph structure, sentence patterns, and stylistic elements.
+                Only change what is necessary to adjust the language level.
+                """
+            else:
+                preserve_style_instructions = """
+                You may restructure the text as needed to match the target level.
+                Feel free to change sentence structures, vocabulary, and organization to best fit the target level.
+                """
+
+            # Форматирование инструкций
+            lesson_format_instructions = """
+            Format your response as clean text without headings or explanations.
+            Only provide the adapted text - do not include any prompts, disclaimers, or instructions.
+            Do not mention the changes you made or explain your process.
+            """
+
+            # Инструкции для конкретных уровней языка
+            level_specific_instructions = ""
+
+            # Определяем систему уровней на основе языка
+            if language.lower() in ["english", "french", "spanish", "german", "italian", "portuguese", "dutch", "swedish", "finnish", "danish", "norwegian", "turkish"]:
+                # CEFR уровни для европейских языков
+                if target_level.upper() in ["C1", "C2"]:
+                    level_specific_instructions = f"""
+                    For {target_level} level (CEFR - Advanced/Proficient):
+                    - Use sophisticated academic and specialized vocabulary
+                    - Incorporate complex grammatical structures (passive voice, subjunctive mood, inversion, etc.)
+                    - Include complex sentence structures with multiple dependent clauses
+                    - Employ advanced cohesive devices and discourse markers
+                    - Use nuanced expressions and precise terminology
+                    - Incorporate idiomatic expressions and metaphoric language where appropriate
+                    - Utilize a formal academic/professional tone throughout
+                    - Demonstrate mastery of complex syntactical patterns
+                    - Include specialized terminology relevant to the subject matter
+
+                    The output should reflect the language proficiency of a highly educated native speaker or academic professional.
+                    """
+                elif target_level.upper() in ["B1", "B2"]:
+                    level_specific_instructions = f"""
+                    For {target_level} level (CEFR - Intermediate):
+                    - Use intermediate vocabulary appropriate for regular conversations and some specific topics
+                    - Include a mix of simple and compound sentences
+                    - Use common idioms and expressions where appropriate
+                    - Employ a semi-formal tone suitable for general audiences
+                    - Include some cohesive devices to link ideas
+                    """
+                elif target_level.upper() in ["A1", "A2"]:
+                    level_specific_instructions = f"""
+                    For {target_level} level (CEFR - Elementary):
+                    - Use only basic, high-frequency vocabulary
+                    - Keep sentences short and simple with basic grammatical structures
+                    - Avoid idioms, phrasal verbs, and complex expressions
+                    - Repeat key vocabulary to reinforce comprehension
+                    - Use very clear and concrete language
+                    """
+            elif language.lower() == "chinese":
+                # HSK уровни для китайского языка
+                if target_level.lower() in ["hsk6", "hsk7-9"]:
+                    level_specific_instructions = f"""
+                    For {target_level} level (Advanced Chinese):
+                    - Use sophisticated vocabulary including literary and formal expressions
+                    - Incorporate complex grammatical structures and patterns
+                    - Include varied sentence structures with multiple clauses
+                    - Use advanced chengyu (四字成语) where appropriate
+                    - Employ formal academic language for specific topics
+                    - Use nuanced expressions and precise terminology
+                    """
+                elif target_level.lower() in ["hsk3", "hsk4", "hsk5"]:
+                    level_specific_instructions = f"""
+                    For {target_level} level (Intermediate Chinese):
+                    - Use vocabulary for daily topics and some specialized areas
+                    - Include both simple and moderately complex sentences
+                    - Use common chengyu (四字成语) where appropriate
+                    - Maintain clear paragraph structure and logical flow
+                    - Use appropriate connectors for coherence
+                    """
+                elif target_level.lower() in ["hsk1", "hsk2"]:
+                    level_specific_instructions = f"""
+                    For {target_level} level (Elementary Chinese):
+                    - Use only basic, high-frequency vocabulary (around 300-600 words)
+                    - Keep sentences short and simple with basic structures
+                    - Avoid complex grammar patterns and idioms
+                    - Use simple sentence patterns with basic subject-verb-object structure
+                    - Repeat key vocabulary to reinforce comprehension
+                    """
+            elif language.lower() == "japanese":
+                # JLPT уровни для японского языка
+                if target_level.lower() in ["n1", "n2"]:
+                    level_specific_instructions = f"""
+                    For {target_level} level (Advanced Japanese):
+                    - Use sophisticated vocabulary including keigo (敬語) and specialized terminology
+                    - Incorporate complex grammatical structures and patterns
+                    - Use kanji appropriate for N1-N2 level (1000+ kanji)
+                    - Include varied sentence structures with multiple clauses
+                    - Use appropriate formal/informal expressions based on context
+                    - Employ specialized vocabulary for academic/professional topics
+                    """
+                elif target_level.lower() in ["n3"]:
+                    level_specific_instructions = f"""
+                    For {target_level} level (Intermediate Japanese):
+                    - Use vocabulary for daily topics and some specialized areas
+                    - Include both simple and moderately complex sentences
+                    - Use kanji appropriate for N3 level (600+ kanji)
+                    - Maintain clear paragraph structure with appropriate particles
+                    - Use some common idiomatic expressions
+                    """
+                elif target_level.lower() in ["n4", "n5"]:
+                    level_specific_instructions = f"""
+                    For {target_level} level (Elementary Japanese):
+                    - Use only basic, high-frequency vocabulary
+                    - Keep sentences short with simple structures
+                    - Use limited kanji (around 100-300 kanji) with furigana support
+                    - Focus on basic particles and verb conjugations
+                    - Use simple polite forms (-masu, -desu)
+                    """
+            elif language.lower() == "korean":
+                # TOPIK уровни для корейского языка
+                if target_level.lower() in ["topik5", "topik6"]:
+                    level_specific_instructions = f"""
+                    For {target_level} level (Advanced Korean):
+                    - Use sophisticated vocabulary including honorific and humble forms
+                    - Incorporate complex grammatical structures and patterns
+                    - Include varied sentence structures with multiple clauses
+                    - Use advanced idiomatic expressions and proverbs
+                    - Employ sophisticated connectors and discourse markers
+                    - Use formal/academic language appropriate for professional contexts
+                    """
+                elif target_level.lower() in ["topik3", "topik4"]:
+                    level_specific_instructions = f"""
+                    For {target_level} level (Intermediate Korean):
+                    - Use vocabulary for daily topics and some specialized areas
+                    - Include both simple and compound sentences
+                    - Use appropriate honorific forms based on context
+                    - Maintain clear paragraph structure with logical flow
+                    - Use common idiomatic expressions where appropriate
+                    """
+                elif target_level.lower() in ["topik1", "topik2"]:
+                    level_specific_instructions = f"""
+                    For {target_level} level (Elementary Korean):
+                    - Use only basic, high-frequency vocabulary
+                    - Keep sentences short with simple structures
+                    - Focus on basic particles and verb conjugations
+                    - Use simple polite forms (-요/습니다)
+                    - Avoid complex grammar patterns and idioms
+                    """
+            elif language.lower() == "arabic":
+                # Уровни для арабского языка
+                if target_level.lower() in ["advanced", "superior", "native"]:
+                    level_specific_instructions = f"""
+                    For {target_level} level (Advanced Arabic):
+                    - Use sophisticated MSA (Modern Standard Arabic) vocabulary and expressions
+                    - Incorporate complex grammatical structures including proper case endings
+                    - Include varied sentence structures with sophisticated connectors
+                    - Use advanced idiomatic expressions where appropriate
+                    - Employ formal/academic language appropriate for literary or media contexts
+                    - Use precise terminology for specialized topics
+                    """
+                elif target_level.lower() in ["intermediate"]:
+                    level_specific_instructions = f"""
+                    For {target_level} level (Intermediate Arabic):
+                    - Use vocabulary for daily topics and general concepts
+                    - Include both simple and compound sentences
+                    - Use appropriate grammatical structures with attention to gender/number agreement
+                    - Maintain clear paragraph structure with logical flow
+                    - Use common idiomatic expressions where appropriate
+                    """
+                elif target_level.lower() in ["beginner", "elementary"]:
+                    level_specific_instructions = f"""
+                    For {target_level} level (Elementary Arabic):
+                    - Use only basic, high-frequency vocabulary
+                    - Keep sentences short with simple structures
+                    - Focus on basic grammar patterns and verb conjugations
+                    - Use simple nominal and verbal sentences
+                    - Avoid complex constructions and case endings
+                    """
+            elif language.lower() == "russian":
+                # TORFL уровни для русского языка
+                if target_level.lower() in ["t3", "t4"]:
+                    level_specific_instructions = f"""
+                    For {target_level} level (Advanced Russian - ТРКИ-III/IV):
+                    - Use sophisticated vocabulary including literary and formal expressions
+                    - Incorporate complex grammatical structures with correct aspect and case usage
+                    - Include varied sentence structures with multiple clauses and participles
+                    - Use advanced idiomatic expressions and phraseology
+                    - Employ stylistically appropriate language for different registers
+                    - Use precise terminology for specialized academic/professional topics
+                    """
+                elif target_level.lower() in ["t1", "t2"]:
+                    level_specific_instructions = f"""
+                    For {target_level} level (Intermediate Russian - ТРКИ-I/II):
+                    - Use vocabulary for daily topics and some specialized areas
+                    - Include both simple and compound sentences with proper case and aspect
+                    - Use appropriate verbal prefixes and motion verbs
+                    - Maintain clear paragraph structure with logical connectors
+                    - Use common idioms and expressions where appropriate
+                    """
+                elif target_level.lower() in ["tea", "tba"]:
+                    level_specific_instructions = f"""
+                    For {target_level} level (Elementary Russian - ТЭУ/ТБУ):
+                    - Use only basic, high-frequency vocabulary
+                    - Keep sentences short with simple structures
+                    - Focus on basic case usage and verb conjugations
+                    - Use simple imperfective/perfective verb forms
+                    - Avoid complex syntax and idioms
+                    """
+            else:
+                # По умолчанию используем CEFR уровни для других языков
+                if target_level.upper() in ["C1", "C2"]:
+                    level_specific_instructions = f"""
+                    For {target_level} level:
+                    - Use sophisticated academic and specialized vocabulary
+                    - Incorporate complex grammatical structures
+                    - Include complex sentence structures with multiple dependent clauses
+                    - Employ advanced cohesive devices and discourse markers
+                    - Use nuanced expressions and precise terminology
+                    """
+                elif target_level.upper() in ["B1", "B2"]:
+                    level_specific_instructions = f"""
+                    For {target_level} level:
+                    - Use intermediate vocabulary appropriate for regular conversations
+                    - Include a mix of simple and compound sentences
+                    - Use common expressions where appropriate
+                    - Employ a semi-formal tone suitable for general audiences
+                    """
+                elif target_level.upper() in ["A1", "A2"]:
+                    level_specific_instructions = f"""
+                    For {target_level} level:
+                    - Use only basic, high-frequency vocabulary
+                    - Keep sentences short and simple with basic structures
+                    - Avoid idioms and complex expressions
+                    - Use very clear and concrete language
+                    """
+
+            # Инструкции для стилей текста
+            style_instructions = ""
+            if "academic" in kwargs.get('vocabulary', '').lower() or "academic" in kwargs.get('style', '').lower():
+                style_instructions = """
+                Style Instructions for Academic Text:
+                - Use formal academic language and specialized terminology
+                - Avoid contractions, colloquialisms, and personal pronouns (I, we)
+                - Employ passive voice and impersonal constructions where appropriate
+                - Use precise terminology and objective language
+                - Include citations or references to theoretical concepts where relevant
+                - Maintain a detached, analytical tone throughout
+                """
+            elif "business" in kwargs.get('vocabulary', '').lower() or "business" in kwargs.get('style', '').lower():
+                style_instructions = """
+                Style Instructions for Business/Professional Text:
+                - Use professional business terminology and formal language
+                - Include industry-specific vocabulary where appropriate
+                - Employ clear, direct language with precise phrasing
+                - Use diplomatic and persuasive language techniques
+                - Maintain a confident, authoritative tone
+                - Focus on action-oriented and results-driven language
+                """
+
+            prompt = f"""
+            {lesson_format_instructions}
+
+            Please adapt the following text to {target_level} level of {language}.
+
+            {preserve_style_instructions}
+
+            {level_specific_instructions}
+
+            {style_instructions}
+
+            When adapting the text:
+            1. Adjust vocabulary complexity to match the target level
+            2. Modify sentence structures as appropriate for the level
+            3. Maintain the original meaning and key information
+            4. Ensure the text remains coherent and natural
+            5. Do not shorten or summarize the text - maintain approximately the same length
+            6. Do not simplify the content if upgrading to a higher level
+
+            Original text:
+            {text}
+
+            {lesson_format_instructions}
+            """
+
+            # Генерируем адаптированный текст
+            adapted_text = await self.generate_content(
+                content_type=ContentType.TEXT_ANALYSIS,
+                prompt=prompt,
+                user_id=user_id,
+                extra_params={"action": "change_text_level", "target_level": target_level}
+            )
+
+            logger.info(f"Generated adapted text (length: {len(adapted_text)})")
+            return adapted_text
+
+        except Exception as e:
+            logger.error(f"Error changing text level: {str(e)}")
+            raise
+
+    @memory_optimized()
+    async def regenerate_text(
+        self,
+        text: str,
+        language: str,
+        vocabulary_type: str = "neutral",
+        preserve_style: bool = True,
+        **kwargs
+    ) -> str:
+        """
+        Перегенерация текста с изменением типа лексики
+
+        Args:
+            text (str): Исходный текст
+            language (str): Язык текста
+            vocabulary_type (str): Тип лексики (formal, informal, neutral, academic, slang)
+            preserve_style (bool): Сохранять ли оригинальный стиль текста
+            **kwargs: Дополнительные параметры
+
+        Returns:
+            str: Перегенерированный текст
+        """
+        try:
+            user_id = kwargs.get('user_id', 1)
+
+            logger.info(f"Regenerating text with vocabulary type '{vocabulary_type}' for {language} text (preserve_style={preserve_style})")
+
+            # Инструкции для сохранения стиля
+            preserve_style_instructions = ""
+            if preserve_style:
+                preserve_style_instructions = """
+                IMPORTANT: Preserve the original style, tone, and structure of the text as much as possible.
+                Keep the same paragraph structure, sentence patterns, and organization.
+                Only change words and expressions to match the target vocabulary type.
+                """
+            else:
+                preserve_style_instructions = """
+                You may restructure the text as needed to match the target vocabulary type.
+                Feel free to change sentence structures, organization, and word choice.
+                """
+
+            # Инструкции для типа лексики
+            vocabulary_instructions = ""
+            if vocabulary_type == "formal":
+                vocabulary_instructions = """
+                Use FORMAL vocabulary and expressions:
+                - Avoid contractions (use "cannot" instead of "can't")
+                - Use sophisticated vocabulary where appropriate
+                - Prefer longer, more complex sentences
+                - Avoid colloquialisms and idioms
+                - Use passive voice where appropriate
+                - Maintain a professional, respectful tone
+                """
+            elif vocabulary_type == "informal":
+                vocabulary_instructions = """
+                Use INFORMAL vocabulary and expressions:
+                - Use contractions (e.g., "can't" instead of "cannot")
+                - Use common, everyday vocabulary
+                - Use shorter, simpler sentences
+                - Include some colloquial expressions and idioms
+                - Prefer active voice
+                - Maintain a friendly, conversational tone
+                """
+            elif vocabulary_type == "academic":
+                vocabulary_instructions = """
+                Use ACADEMIC vocabulary and expressions:
+                - Use field-specific terminology and scholarly language
+                - Employ precise, technical vocabulary and formal academic expressions
+                - Use complex sentence structures with multiple dependent clauses
+                - Maintain an objective, analytical tone throughout
+                - Use sophisticated transitional phrases to connect ideas
+                - Avoid personal pronouns and maintain academic distance
+                - Include nominalizations (using nouns instead of verbs where possible)
+                - Employ passive constructions where appropriate
+                - Use proper citations and references when mentioning theories or concepts
+                - Include specialized terminology relevant to the subject matter
+                - Demonstrate mastery of complex syntactical patterns
+
+                The output should reflect the language of scholarly articles and academic papers.
+                """
+            elif vocabulary_type == "business":
+                vocabulary_instructions = """
+                Use BUSINESS/PROFESSIONAL vocabulary and expressions:
+                - Use professional business terminology and industry-specific vocabulary
+                - Employ formal language with precise, concise phrasing
+                - Include business jargon and industry terms where appropriate
+                - Use diplomatic and persuasive language techniques
+                - Maintain a confident, authoritative tone
+                - Focus on action-oriented and results-driven language
+                - Use professional greetings and closings if relevant
+                - Include relevant business concepts and frameworks
+                - Employ strategic and analytical language
+                - Balance between accessibility and professional terminology
+                """
+            elif vocabulary_type == "slang":
+                vocabulary_instructions = """
+                Use modern SLANG and casual expressions:
+                - Include contemporary slang terms where appropriate
+                - Use very informal vocabulary and expressions
+                - Use shorter sentences and fragments
+                - Include conversational fillers (well, you know, like)
+                - Maintain a very casual, friendly tone
+                - Use first and second person perspectives
+                """
+            else:  # neutral
+                vocabulary_instructions = """
+                Use NEUTRAL vocabulary and expressions:
+                - Balance between formal and informal language
+                - Use common vocabulary with some sophisticated terms
+                - Vary sentence length and complexity
+                - Minimize slang or highly technical terminology
+                - Maintain a balanced, accessible tone
+                """
+
+            # Форматирование инструкций
+            lesson_format_instructions = """
+            Format your response as clean text without headings or explanations.
+            Only provide the regenerated text - do not include any prompts, disclaimers, or instructions.
+            Do not mention the changes you made or explain your process.
+            """
+
+            prompt = f"""
+            {lesson_format_instructions}
+
+            Please regenerate the following text in {language} using {vocabulary_type.upper()} vocabulary and expressions.
+
+            {preserve_style_instructions}
+
+            {vocabulary_instructions}
+
+            When regenerating the text:
+            1. Change vocabulary and expressions to match the target style
+            2. Maintain the original meaning and key information
+            3. Ensure the text remains coherent and natural
+            4. Do not shorten or summarize the text - maintain approximately the same length
+            5. Preserve the original tone while adapting to the requested vocabulary type
+
+            Original text:
+            {text}
+
+            {lesson_format_instructions}
+            """
+
+            # Генерируем перегенерированный текст
+            regenerated_text = await self.generate_content(
+                content_type=ContentType.TEXT_ANALYSIS,
+                prompt=prompt,
+                user_id=user_id,
+                extra_params={"action": "regenerate_text", "vocabulary_type": vocabulary_type}
+            )
+
+            logger.info(f"Generated regenerated text (length: {len(regenerated_text)})")
+            return regenerated_text
+
+        except Exception as e:
+            logger.error(f"Error regenerating text: {str(e)}")
+            raise
+
+    async def generate_course_structure(self, prompt: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Генерирует полную структуру курса с множеством уроков
+
+        Args:
+            prompt: Подготовленный промпт с контекстом и требованиями
+
+        Returns:
+            Dict[str, Any]: Структурированные данные для курса
+        """
+        try:
+            # Формируем текстовый промпт для AI
+            formatted_prompt = f"""
+            # Задача по генерации полного курса
+
+            ## ИНСТРУКЦИИ ПО ФОРМАТУ ОТВЕТА
+            1. ОТВЕТ ДОЛЖЕН БЫТЬ В ФОРМАТЕ JSON С ОБЯЗАТЕЛЬНЫМИ ПОЛЯМИ name, description, lessons
+            2. Поле lessons ДОЛЖНО БЫТЬ МАССИВОМ ОБЪЕКТОВ, где каждый объект - это урок с полями: title, objectives, grammar, vocabulary, activities
+            3. Поле activities ДОЛЖНО БЫТЬ МАССИВОМ ОБЪЕКТОВ, каждый с полями 'name' и 'description' (2-3 активности на урок)
+            4. НЕ ВКЛЮЧАЙ поля "duration", "materials" или "homework"
+            5. УБЕДИСЬ, что JSON правильно закрыт и валиден!
+            6. ОТВЕТ ДОЛЖЕН ВКЛЮЧАТЬ ТОЛЬКО JSON БЕЗ ПОЯСНЕНИЙ ДО ИЛИ ПОСЛЕ
+
+            ## СТРУКТУРА ДОЛЖНА БЫТЬ ТАКОЙ:
+            {{
+              "name": "Название курса",
+              "description": "Описание курса",
+              "prerequisites": ["Знание 1", "Знание 2"],
+              "learning_outcomes": ["Результат 1", "Результат 2"],
+              "lessons": [
+                {{
+                  "title": "Название урока 1",
+                  "objectives": ["Цель 1", "Цель 2"],
+                  "grammar": ["Грамматика 1", "Грамматика 2"],
+                  "vocabulary": ["Слово 1", "Слово 2"],
+                  "activities": [
+                    {{
+                      "name": "Название активности 1",
+                      "description": "Краткое описание активности 1"
+                    }},
+                    {{
+                      "name": "Название активности 2",
+                      "description": "Краткое описание активности 2"
+                    }}
+                  ]
+                }},
+                {{
+                  "title": "Название урока 2",
+                  "objectives": ["Цель 1", "Цель 2"],
+                  "grammar": ["Грамматика 1", "Грамматика 2"],
+                  "vocabulary": ["Слово 1", "Слово 2"],
+                  "activities": [
+                    {{
+                      "name": "Название активности 1",
+                      "description": "Краткое описание активности 1"
+                    }},
+                    {{
+                      "name": "Название активности 2",
+                      "description": "Краткое описание активности 2"
+                    }}
+                  ]
+                }}
+              ]
+            }}
+
+            ## Информация о курсе
+            - Название курса: {prompt['context']['course_name']}
+            - Язык: {prompt['context']['language']}
+            - Начальный уровень: {prompt['context'].get('start_level', 'beginner')}
+            - Целевой уровень: {prompt['context']['level']}
+            - Целевая аудитория: {prompt['context']['target_audience']}
+            - Формат обучения: {prompt['context']['format']}
+            - Количество уроков: {prompt['context']['lessons_count']}
+            - Продолжительность урока: {prompt['context']['lesson_duration']} минут
+
+            ## Информация о студенте
+            - Возраст: {prompt['context'].get('student_age', 'взрослый')}
+            - Интересы: {prompt['context'].get('student_interests', '')}
+            - Цели обучения: {prompt['context'].get('student_goals', '')}
+            - Типичные ошибки: {prompt['context'].get('common_mistakes', '')}
+
+            ## Методика обучения
+            - Используемая методика: {prompt['context'].get('methodology', 'коммуникативная')}
+
+            ## Фокус
+            - Основные темы: {prompt['context']['main_topics']}
+            - Грамматический фокус: {prompt['context']['grammar_focus']}
+            - Лексический фокус: {prompt['context']['vocabulary_focus']}
+
+            ## Навыки
+            - Включаемые навыки: {', '.join(prompt['context']['skills'])}
+            - Включать игры: {'Да' if prompt['context'].get('include_games', False) else 'Нет'}
+
+            ## Подготовка к экзамену
+            {f'- Экзамен: {prompt["context"]["exam_prep"]}' if prompt['context'].get('exam_prep') else '- Экзамен: не требуется'}
+            {f'- Собственный экзамен: {prompt["context"]["custom_exam"]}' if prompt['context'].get('custom_exam') else ''}
+            {f'- Количество уроков на подготовку: {prompt["context"].get("exam_prep_lessons", 0)}' if prompt['context'].get('exam_prep') else ''}
+
+            ## Дополнительно
+            {f'- Описание: {prompt["context"]["description"]}' if prompt['context'].get('description') else ''}
+
+            ## Требования
+            {prompt['requirements']}
+
+            ВАЖНО: Сгенерируй ТОЛЬКО JSON без дополнительных пояснений или текста, строго по указанной выше структуре.
+            """
+
+            # Пробуем использовать асинхронный подход через Netlify Functions
+            try:
+                # Проверка настроек для асинхронной генерации
+                import os
+                from dotenv import load_dotenv
+                import httpx
+
+                # Загружаем переменные окружения
+                load_dotenv()
+
+                # Получаем настройки Cloudflare и Netlify
+                CLOUDFLARE_PROXY_URL = os.getenv("CLOUDFLARE_PROXY_URL", "https://aiteachers.netlify.app/api")
+                AUTH_TOKEN = os.getenv("API_AUTH_TOKEN")
+                API_KEY = os.getenv("GEMINI_API_KEY")
+
+                # Проверяем, включен ли асинхронный режим
+                USE_ASYNC_MODE = os.getenv("USE_ASYNC_MODE", "True").lower() in ("true", "1", "yes")
+
+                if not USE_ASYNC_MODE:
+                    logger.warning("Асинхронный режим отключен в настройках. Используем стандартный метод генерации.")
+                    raise ValueError("Асинхронный режим отключен")
+
+                # Проверяем наличие необходимых переменных окружения
+                if not all([CLOUDFLARE_PROXY_URL, AUTH_TOKEN, API_KEY]):
+                    logger.warning("Не все необходимые переменные окружения установлены для асинхронной генерации.")
+                    raise ValueError("Недостаточно параметров для асинхронной генерации")
+
+                # Формируем URL для асинхронного API
+                base_url = CLOUDFLARE_PROXY_URL.split('/api')[0]
+
+                # Пробуем сначала асинхронный API, если он недоступен, используем обычный
+                try:
+                    async_url = f"{base_url}/.netlify/functions/course-generator-async"
+                    logger.info(f"Используем асинхронный API по URL: {async_url}")
+
+                    # Подготавливаем данные запроса
+                    request_data = {
+                        "contents": [
+                            {
+                                "parts": [
+                                    {
+                                        "text": formatted_prompt
+                                    }
+                                ]
+                            }
+                        ],
+                        "generationConfig": {
+                            "temperature": 0.7,
+                            "maxOutputTokens": 4096,
+                            "topP": 0.95,
+                            "topK": 40
+                        }
+                    }
+
+                    # Заголовки для запроса
+                    headers = {
+                        "Content-Type": "application/json",
+                        "X-Auth-Token": AUTH_TOKEN,
+                        "X-Component-ID": "course-generator",
+                        "X-Gemini-API-Key": API_KEY
+                    }
+
+                    logger.info("Отправка асинхронного запроса на генерацию структуры курса")
+
+                    # Создаем клиент для HTTP запросов с увеличенным таймаутом
+                    async with httpx.AsyncClient(timeout=30.0) as client:
+                        # Отправляем задачу на выполнение
+                        submit_response = await client.post(
+                            async_url,
+                            json=request_data,
+                            headers=headers
+                        )
+
+                        # Проверяем статус ответа
+                        if submit_response.status_code != 202:
+                            logger.error(f"Ошибка при отправке асинхронной задачи: HTTP {submit_response.status_code}")
+                            logger.error(f"Текст ошибки: {submit_response.text}")
+                            raise ValueError(f"Ошибка при отправке асинхронной задачи: HTTP {submit_response.status_code}")
+
+                        # Получаем информацию о задаче
+                        task_info = submit_response.json()
+                        task_id = task_info["taskId"]
+                        check_status_url = task_info["checkStatusUrl"]
+
+                        logger.info(f"Асинхронная задача создана с ID: {task_id}. URL для проверки статуса: {check_status_url}")
+
+                        # Определяем максимальное количество попыток и интервал между ними
+                        max_retries = 60     # Максимальное количество попыток (120 секунд при интервале 2 секунды)
+                        retry_interval = 2   # Интервал между попытками в секундах
+
+                        # Периодически проверяем статус выполнения задачи
+                        for attempt in range(max_retries):
+                            # Делаем паузу перед проверкой статуса
+                            await asyncio.sleep(retry_interval)
+
+                            logger.info(f"Проверка статуса задачи {task_id}, попытка {attempt+1}/{max_retries}")
+
+                            # Запрашиваем статус задачи
+                            status_response = await client.get(
+                                f"{base_url}{check_status_url}",
+                                headers=headers
+                            )
+
+                            # Обрабатываем ответ
+                            if status_response.status_code == 200:
+                                # Задача успешно выполнена
+                                logger.info(f"Задача {task_id} успешно выполнена")
+
+                                # Получаем результат
+                                try:
+                                    result = status_response.json()
+
+                                    # Логируем полный ответ для отладки, разбивая по частям если он большой
+                                    logger.info("=== ПОЛНЫЙ ОТВЕТ ОТ АСИНХРОННОЙ ЗАДАЧИ ===")
+                                    full_response_str = json.dumps(result)
+                                    if len(full_response_str) > 10000:
+                                        # Разбиваем на фрагменты по 5000 символов для удобства чтения
+                                        for i in range(0, len(full_response_str), 5000):
+                                            end_idx = min(i + 5000, len(full_response_str))
+                                            logger.info(f"Фрагмент ответа {i//5000 + 1}/{(len(full_response_str)//5000) + 1}: {full_response_str[i:end_idx]}")
+                                    else:
+                                        logger.info(f"Полный ответ: {full_response_str}")
+                                    logger.info("=== КОНЕЦ ПОЛНОГО ОТВЕТА ОТ АСИНХРОННОЙ ЗАДАЧИ ===")
+
+                                    # Проверяем, есть ли в ответе структура Gemini API
+                                    if isinstance(result, dict) and "candidates" in result and len(result["candidates"]) > 0:
+                                        candidate = result["candidates"][0]
+
+                                        if "content" in candidate and "parts" in candidate["content"]:
+                                            content = candidate["content"]["parts"][0]["text"]
+
+                                            # Очищаем JSON ответ
+                                            content = self._clean_json_response(content)
+                                            json_str = self._extract_json_from_content(content)
+
+                                            if json_str:
+                                                # Парсим JSON
+                                                course_structure = await self._parse_json_safely(json_str)
+
+                                                # Проверяем валидность структуры
+                                                if course_structure and isinstance(course_structure, dict):
+                                                    # Проверяем наличие обязательных полей
+                                                    required_fields = ['name', 'description', 'lessons']
+                                                    for field in required_fields:
+                                                        if field not in course_structure:
+                                                            logger.warning(f"В структуре курса отсутствует обязательное поле: {field}")
+                                                            course_structure[field] = self._generate_default_value(field, prompt)
+
+                                                    logger.info(f"Структура курса успешно получена через асинхронный подход")
+                                                    return course_structure
+                                except Exception as e:
+                                    logger.error(f"Ошибка при обработке результата: {str(e)}")
+
+                                logger.warning("Получен неожиданный формат ответа от асинхронной задачи")
+                                break
+
+                            elif status_response.status_code == 202:
+                                # Задача еще выполняется
+                                result = status_response.json()
+                                logger.info(f"Задача {task_id} в процессе выполнения: {result.get('message', 'статус неизвестен')}")
+                                continue
+
+                            else:
+                                # Ошибка при запросе статуса
+                                logger.error(f"Ошибка при запросе статуса задачи: HTTP {status_response.status_code}")
+                                logger.error(f"Текст ошибки: {status_response.text}")
+                                break
+
+                        # Если мы здесь, значит, не удалось получить результат асинхронным способом
+                        logger.warning("Не удалось получить результат асинхронным способом, переключаемся на стандартный метод генерации")
+
+                except Exception as async_error:
+                    logger.error(f"Ошибка при асинхронной генерации: {str(async_error)}")
+                    logger.info("Переключаемся на стандартный способ генерации")
+                    # Продолжаем со стандартным методом генерации
+
+                # Стандартный способ генерации (запасной вариант)
+                logger.info("Начинаем стандартную генерацию структуры курса")
+                content = await self.generate_content(
+                    user_id=0,  # Системная генерация
+                    prompt=formatted_prompt,
+                    content_type=ContentType.STRUCTURED_DATA,
+                    extra_params={"format": "json", "task": "course_structure", "component_id": "course-generator"}
+                )
+
+                logger.info(f"Получен ответ с длиной {len(content) if content else 0} символов")
+
+                # Проверка на пустой ответ
+                if not content or len(content.strip()) < 10:
+                    logger.error("Получен пустой или слишком короткий ответ от API")
+                    raise ValueError("Пустой ответ от генератора")
+
+                # Удаляем отформатированные блоки, если они есть
+                content = self._clean_json_response(content)
+
+                # Извлекаем JSON из ответа
+                json_str = self._extract_json_from_content(content)
+
+                if not json_str:
+                    logger.error("Не удалось извлечь JSON из контента")
+                    # Попытка сгенерировать базовую структуру
+                    return self._generate_fallback_structure(prompt)
+
+                # Парсим JSON с обработкой ошибок
+                course_structure = self._parse_json_safely(json_str)
+
+                # Проверяем структуру результата
+                if not course_structure or not isinstance(course_structure, dict):
+                    logger.error("Результат не является словарем или пустой")
+                    return self._generate_fallback_structure(prompt)
+
+                # Проверяем наличие обязательных полей
+                required_fields = ['name', 'description', 'lessons']
+                for field in required_fields:
+                    if field not in course_structure:
+                        logger.warning(f"В структуре курса отсутствует обязательное поле: {field}")
+                        course_structure[field] = self._generate_default_value(field, prompt)
+
+                # Проверка уроков
+                if not isinstance(course_structure.get('lessons', []), list) or len(course_structure.get('lessons', [])) == 0:
+                    logger.warning("Отсутствуют уроки в структуре курса")
+                    course_structure['lessons'] = self._generate_default_lessons(prompt)
+
+                logger.info(f"Структура курса успешно сгенерирована, содержит {len(course_structure.get('lessons', []))} уроков")
+                return course_structure
+
+            except Exception as e:
+                logger.error(f"Общая ошибка генерации структуры курса: {str(e)}")
+                # Вместо поднятия исключения, возвращаем базовую структуру
+                return self._generate_fallback_structure(prompt)
+
+        except Exception as e:
+            logger.error(f"Ошибка при генерации структуры курса: {str(e)}")
+            # Вместо поднятия исключения, возвращаем базовую структуру
+            return self._generate_fallback_structure(prompt)
+
+    async def _clear_cache_before_generation(self):
+        """
+        Очищает кеш перед генерацией структуры курса для избежания использования старых данных
+        """
+        try:
+            from ...core.cache import CacheService
+            cache = CacheService()
+            await cache.invalidate_pattern("course_structure:*")
+            logger.info("Кеш структуры курса успешно очищен перед генерацией")
+        except Exception as e:
+            logger.warning(f"Не удалось очистить кеш перед генерацией: {str(e)}")
+
+    def _enrich_lesson_data(self, lesson: dict, index: int) -> dict:
+        """
+        Обогащает данные урока недостающими полями.
+
+        Args:
+            lesson: Исходные данные урока
+            index: Номер урока
+
+        Returns:
+            Обогащенный словарь урока с обязательными полями
+        """
+        # Создаем копию для изменения
+        enriched = lesson.copy()
+
+        # Обязательные поля для урока
+        required_fields = {
+            "title": "Урок {0}".format(index),
+            "description": "Описание урока {0}".format(index),
+            "objectives": [],
+            "materials": [],
+            "vocabulary": [],
+            "grammar": [],
+            "procedure": [],
+            "homework": {
+                "description": "Домашнее задание для урока {0}".format(index),
+                "tasks": ["Выполнить упражнения по теме урока"],
+                "estimatedTime": 30
+            }
+        }
+
+        # Заполняем недостающие поля
+        for field, default_value in required_fields.items():
+            if field not in enriched or not enriched[field]:
+                enriched[field] = default_value
+                logger.info("Добавлено недостающее поле '{0}' для урока {1}".format(field, index))
+
+        # Если есть поля типа procedure, objectives и т.д., но они строки, преобразуем их в списки
+        fields_to_check = ["objectives", "materials", "vocabulary", "grammar", "procedure"]
+        for field in fields_to_check:
+            if field in enriched and isinstance(enriched[field], str):
+                # Пытаемся разделить строку на абзацы или пункты
+                parts = [part.strip() for part in enriched[field].split('\n') if part.strip()]
+                if not parts:  # Если после разделения список пустой
+                    parts = [enriched[field]]  # Используем всю строку как один элемент
+                enriched[field] = parts
+                logger.info("Преобразовано поле '{0}' из строки в список для урока {1}".format(field, index))
+
+        # КРИТИЧЕСКИ ВАЖНОЕ ИСПРАВЛЕНИЕ: гарантируем, что homework всегда будет словарем в соответствии со схемой
+        if "homework" in enriched:
+            # Если homework не является словарем, преобразуем его
+            if not isinstance(enriched["homework"], dict):
+                # Сохраняем оригинальные задания
+                original_homework = enriched["homework"]
+
+                # Создаем правильную структуру словаря
+                homework_dict = {
+                    "description": f"Домашнее задание для урока {index}",
+                    "tasks": [],
+                    "estimatedTime": 30
+                }
+
+                # Преобразуем исходное значение в список задач
+                if isinstance(original_homework, list):
+                    # Если это уже список, используем его как tasks
+                    homework_dict["tasks"] = [str(item) for item in original_homework]
+                elif isinstance(original_homework, str):
+                    # Если это строка, разбиваем ее на отдельные задания
+                    items = [item.strip() for item in original_homework.split('\n') if item.strip()]
+                    homework_dict["tasks"] = items if items else [original_homework]
+                else:
+                    # Если что-то совсем непонятное, создаем задание по умолчанию
+                    homework_dict["tasks"] = ["Выполнить упражнения по теме урока"]
+
+                enriched["homework"] = homework_dict
+                logger.info(f"Преобразовано поле 'homework' в правильный формат словаря для урока {index}")
+            else:
+                # Проверяем наличие необходимых полей в уже существующем словаре homework
+                if "description" not in enriched["homework"] or not enriched["homework"]["description"]:
+                    enriched["homework"]["description"] = f"Домашнее задание для урока {index}"
+
+                if "tasks" not in enriched["homework"] or not enriched["homework"]["tasks"]:
+                    enriched["homework"]["tasks"] = ["Выполнить упражнения по теме урока"]
+
+                # Гарантируем, что tasks - это список
+                if not isinstance(enriched["homework"]["tasks"], list):
+                    if isinstance(enriched["homework"]["tasks"], str):
+                        enriched["homework"]["tasks"] = [enriched["homework"]["tasks"]]
+                    else:
+                        enriched["homework"]["tasks"] = [str(enriched["homework"]["tasks"])]
+
+                # Гарантируем, что estimatedTime существует и положительный
+                if "estimatedTime" not in enriched["homework"] or not isinstance(enriched["homework"]["estimatedTime"], (int, float)) or enriched["homework"]["estimatedTime"] <= 0:
+                    enriched["homework"]["estimatedTime"] = 30
+
+        # Добавляем поле 'order' если его нет
+        if 'order' not in enriched:
+            enriched['order'] = index
+
+        # Проверяем, что duration > 0
+        if 'duration' not in enriched or not enriched['duration'] or enriched['duration'] <= 0:
+            enriched['duration'] = 60  # Значение по умолчанию - 60 минут
+            logger.info("Установлено положительное значение продолжительности для урока {0}".format(index))
+
+        return enriched
+
+    def _clean_json_response(self, content: str) -> str:
+        """
+        Очищает ответ от форматированных блоков кода и извлекает JSON из ответа API
+
+        Args:
+            content: Исходный контент от API
+
+        Returns:
+            str: Корректно извлеченный JSON
+        """
+        # Логируем исходный контент
+        logger.info(f"Исходный контент перед очисткой длиной {len(content)} символов")
+        logger.info(f"ПЕРВЫЕ 100 СИМВОЛОВ ИСХОДНОГО КОНТЕНТА: {content[:100]}")
+        logger.info(f"ПОСЛЕДНИЕ 100 СИМВОЛОВ ИСХОДНОГО КОНТЕНТА: {content[-100:]}")
+
+        # ПОДХОД 1: Извлечение JSON из markdown-блока
+        json_markdown_match = re.search(r'```json\s*([\s\S]*?)\s*```', content)
+        if json_markdown_match:
+            json_content = json_markdown_match.group(1).strip()
+            logger.info(f"Извлечен JSON из markdown-блока, длина: {len(json_content)}")
+
+            # Проверяем, что JSON валиден и содержит нужные поля
+            try:
+                json_obj = json.loads(json_content)
+                if isinstance(json_obj, dict) and 'name' in json_obj and 'lessons' in json_obj:
+                    lessons_count = len(json_obj.get('lessons', []))
+                    logger.info(f"Извлечен корректный JSON курса с {lessons_count} уроками")
+                    return json_content
+            except Exception as e:
+                logger.warning(f"Ошибка при проверке JSON из markdown-блока: {str(e)}")
+
+        # ПОДХОД 2: Попытка найти API-ответ в формате JSON и извлечь полную структуру курса
+        try:
+            # Пытаемся определить, содержит ли текст структуру API-ответа
+            if re.search(r'"candidates".*?"content".*?"parts".*?"text"', content, re.DOTALL):
+                api_json = json.loads(content)
+
+                # Извлекаем текст из структуры API-ответа
+                if (api_json.get('candidates') and api_json['candidates'][0].get('content') and
+                        api_json['candidates'][0]['content'].get('parts')):
+
+                    text_content = api_json['candidates'][0]['content']['parts'][0].get('text', '')
+
+                    # Снова ищем markdown-блок в извлеченном тексте
+                    markdown_match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', text_content)
+                    if markdown_match:
+                        json_content = markdown_match.group(1).strip()
+
+                        # Валидируем извлеченный JSON
+                        try:
+                            json_obj = json.loads(json_content)
+                            if isinstance(json_obj, dict) and 'name' in json_obj and 'lessons' in json_obj:
+                                lessons_count = len(json_obj.get('lessons', []))
+                                logger.info(f"Извлечен JSON из структуры API-ответа, {lessons_count} уроков")
+                                return json_content
+                        except Exception as e:
+                            logger.warning(f"Ошибка при проверке JSON из API-ответа: {str(e)}")
+        except Exception as e:
+            logger.warning(f"Ошибка при обработке API-ответа: {str(e)}")
+
+        # ПОДХОД 3: Удаление markdown-тегов и очистка
+        try:
+            cleaned_content = re.sub(r'```(?:json)?\s*([\s\S]*?)\s*```', r'\1', content)
+            cleaned_content = cleaned_content.strip()
+
+            # Удаляем комментарии и лишний текст
+            cleaned_content = re.sub(r'//.*?(?:\n|$)', '\n', cleaned_content)
+            cleaned_content = re.sub(r'(?m)^\s*//.*$', '', cleaned_content)
+            cleaned_content = re.sub(r'/\*[\s\S]*?\*/', '', cleaned_content)
+            cleaned_content = re.sub(r'^.*?(?=\{)', '', cleaned_content, flags=re.DOTALL)
+            cleaned_content = re.sub(r'(?<=\}).*$', '', cleaned_content, flags=re.DOTALL)
+
+            # Пытаемся найти полный JSON-объект в очищенном тексте
+            # Находим все объекты, начинающиеся с { и заканчивающиеся на }
+            json_candidates = []
+
+            # Сканируем весь текст
+            for i in range(len(cleaned_content)):
+                if cleaned_content[i] == '{':
+                    # Нашли открывающую скобку, считаем баланс
+                    balance = 1
+                    start_idx = i
+
+                    for j in range(i + 1, len(cleaned_content)):
+                        if cleaned_content[j] == '{':
+                            balance += 1
+                        elif cleaned_content[j] == '}':
+                            balance -= 1
+
+                        if balance == 0:
+                            # Нашли закрывающую скобку, добавляем кандидата
+                            candidate = cleaned_content[start_idx:j + 1]
+                            try:
+                                parsed = json.loads(candidate)
+                                if isinstance(parsed, dict):
+                                    # Оцениваем, насколько хорошо этот кандидат подходит для структуры курса
+                                    score = 0
+                                    if 'name' in parsed: score += 5
+                                    if 'description' in parsed: score += 5
+                                    if 'lessons' in parsed: score += 10
+                                    if score > 0:
+                                        json_candidates.append((candidate, score))
+                            except:
+                                pass
+                            break
+
+            # Сортируем кандидатов по оценке и возвращаем лучшего
+            if json_candidates:
+                json_candidates.sort(key=lambda x: x[1], reverse=True)
+                best_candidate, score = json_candidates[0]
+
+                try:
+                    parsed = json.loads(best_candidate)
+                    if isinstance(parsed, dict) and 'lessons' in parsed:
+                        logger.info(
+                            f"Найден JSON-объект курса с {len(parsed.get('lessons', []))} уроками (оценка: {score})")
+                        return best_candidate
+                except:
+                    pass
+        except Exception as e:
+            logger.warning(f"Ошибка при анализе очищенного контента: {str(e)}")
+
+        # ПОДХОД 4: Использование регулярных выражений для поиска фигурных скобок на верхнем уровне
+        full_json_match = re.search(r'(?s)(\{.*"name".*"description".*"lessons".*\})', content)
+        if full_json_match:
+            potential_json = full_json_match.group(1)
+            try:
+                json_obj = json.loads(potential_json)
+                if isinstance(json_obj, dict) and 'name' in json_obj and 'lessons' in json_obj:
+                    logger.info(
+                        f"Извлечен JSON с помощью регулярного выражения, {len(json_obj.get('lessons', []))} уроков")
+                    return potential_json
+            except:
+                pass
+
+        # ПОДХОД 5: Последняя попытка - fallback к старому методу
+        try:
+            # Находим первую открывающую и последнюю закрывающую скобку
+            open_brace_idx = content.find('{')
+            close_brace_idx = content.rfind('}')
+
+            if open_brace_idx >= 0 and close_brace_idx > open_brace_idx:
+                fallback_json = content[open_brace_idx:close_brace_idx + 1]
+                try:
+                    json_obj = json.loads(fallback_json)
+                    if isinstance(json_obj, dict):
+                        logger.warning(
+                            f"Использован fallback метод. Найден JSON-объект с ключами: {list(json_obj.keys())}")
+                        return fallback_json
+                except:
+                    pass
+        except:
+            pass
+
+        # Если ничего не сработало, возвращаем исходный контент с предупреждением
+        logger.warning("Все методы извлечения JSON не сработали, возвращаем исходный контент")
+        return content
+
+    def _extract_json_from_content(self, content: str) -> str:
+        """
+        Извлекает JSON-строку из контента
+
+        Args:
+            content: Исходный контент
+
+        Returns:
+            str: JSON-строка или пустая строка, если JSON не найден
+        """
+        logger.info("Извлечение JSON из контента длиной {0} символов".format(len(content)))
+
+        # Проверяем наличие корректного JSON
+        if not content or len(content.strip()) < 5:
+            logger.warning("Контент слишком короткий для JSON")
+            return ""
+
+        # Если контент полностью окружен бэктиками, удаляем их
+        if content.strip().startswith('```') and content.strip().endswith('```'):
+            content = re.sub(r'^```.*?\n', '', content.strip())  # Удаляем открывающий бэктик с возможным указанием языка
+            content = re.sub(r'\n```$', '', content)  # Удаляем закрывающий бэктик
+            logger.info("Удалены окружающие контент бэктики")
+
+        # Если контент окружен одинарными бэктиками, удаляем их
+        if content.strip().startswith('`') and content.strip().endswith('`'):
+            content = content.strip()[1:-1].strip()
+            logger.info("Удалены окружающие контент одинарные бэктики")
+
+        # Первоначальная проверка - проверяем, может ли контент уже быть валидным JSON курса
+        if content.strip().startswith('{') and content.strip().endswith('}'):
+            try:
+                parsed = json.loads(content)
+                if isinstance(parsed, dict) and 'lessons' in parsed:
+                    logger.info(f"Контент уже является валидным JSON курса с {len(parsed['lessons'])} уроками")
+                    return content
+            except json.JSONDecodeError as e:
+                logger.debug(f"Контент не является валидным JSON: {str(e)}")
+
+        # Сначала проверим, является ли весь контент валидным JSON
+        content_stripped = content.strip()
+        if (content_stripped.startswith('{') and content_stripped.endswith('}')) or \
+           (content_stripped.startswith('[') and content_stripped.endswith(']')):
+            try:
+                # Пробуем разобрать весь контент как JSON
+                json_obj = json.loads(content_stripped)
+
+                # Проверяем, является ли это структурой курса
+                if isinstance(json_obj, dict) and 'lessons' in json_obj:
+                    logger.info(f"Весь контент является валидным JSON курса с {len(json_obj['lessons'])} уроками")
+                    return content_stripped
+                else:
+                    logger.debug(f"Контент является валидным JSON, но не содержит уроки. Ключи: {list(json_obj.keys() if isinstance(json_obj, dict) else [])}")
+            except json.JSONDecodeError as e:
+                logger.debug(f"Ошибка парсинга JSON: {str(e)} в позиции {e.pos}")
+                # Пытаемся показать контекст вокруг ошибки
+                if hasattr(e, 'pos') and e.pos is not None:
+                    pos = e.pos
+                    start = max(0, pos - 20)
+                    end = min(len(content_stripped), pos + 20)
+                    context = content_stripped[start:end]
+                    logger.debug(f"Контекст ошибки: ...{context}...")
+
+        # Ищем JSON в блоках кода
+        json_block_pattern = r'```(?:json)?\s*([\s\S]*?)\s*```'
+        json_blocks = re.findall(json_block_pattern, content)
+
+        if json_blocks:
+            # Проверяем все найденные блоки JSON на валидность
+            for block in json_blocks:
+                # Проверяем, начинается ли блок с { или [ и заканчивается } или ]
+                block_stripped = block.strip()
+                if (block_stripped.startswith('{') and block_stripped.endswith('}')) or \
+                   (block_stripped.startswith('[') and block_stripped.endswith(']')):
+                    try:
+                        # Пробуем разобрать JSON
+                        parsed = json.loads(block_stripped)
+                        # Проверяем, является ли это JSON-объектом курса (должен содержать lessons)
+                        if isinstance(parsed, dict) and 'lessons' in parsed:
+                            logger.info(f"Найдена структура курса в блоке кода длиной {len(block_stripped)} символов")
+                            return block_stripped
+                        # Или если это массив уроков
+                        elif isinstance(parsed, list) and len(parsed) > 0 and \
+                             all(isinstance(item, dict) and 'title' in item for item in parsed):
+                            logger.info(f"Найден массив уроков в блоке кода длиной {len(block_stripped)} символов")
+                            return block_stripped
+                        else:
+                            keys = list(parsed.keys()) if isinstance(parsed, dict) else "массив"
+                            logger.debug(f"Блок JSON не содержит структуру курса. Ключи: {keys}")
+                    except json.JSONDecodeError as e:
+                        logger.debug(f"Ошибка парсинга блока: {str(e)}")
+
+        # Добавляем логирование для первых и последних 50 символов контента
+        if len(content) > 100:
+            logger.info(f"Первые 50 символов контента: {content[:50]}")
+            logger.info(f"Последние 50 символов контента: {content[-50:]}")
+
+        # Пытаемся исправить возможно повреждённый JSON
+        try:
+            # Пробуем исправить кавычки и экранирование
+            fixed_content = content.replace("'", '"')  # Заменяем одинарные кавычки на двойные
+            fixed_content = re.sub(r'(?<!\\)"', '\\"', fixed_content)  # Экранируем неэкранированные кавычки
+            fixed_content = re.sub(r'(?<!\\)\\(?!["\\])', '\\\\', fixed_content)  # Экранируем одиночные слеши
+
+            # Пытаемся найти валидный JSON в исправленном контенте
+            json_match = re.search(r'({[^{}]*({[^{}]*})*[^{}]*})', fixed_content)
+            if json_match:
+                potential_json = json_match.group(1)
+                try:
+                    parsed = json.loads(potential_json)
+                    if isinstance(parsed, dict) and 'lessons' in parsed:
+                        logger.info(f"Найден исправленный JSON курса длиной {len(potential_json)} символов")
+                        return potential_json
+                except json.JSONDecodeError:
+                    pass
+        except Exception as e:
+            logger.debug(f"Ошибка при попытке исправить JSON: {str(e)}")
+
+        # Ищем первую открывающую и последнюю закрывающую скобки для объекта
+        start_idx = content.find('{')
+        if start_idx >= 0:
+            # Ищем соответствующую закрывающую скобку
+            bracket_level = 0
+            json_end = -1
+            in_string = False
+            escape_next = False
+
+            for i in range(start_idx, len(content)):
+                char = content[i]
+
+                if escape_next:
+                    escape_next = False
+                    continue
+
+                if char == '\\':
+                    escape_next = True
+                elif char == '"' and not escape_next:
+                    in_string = not in_string
+                elif not in_string:
+                    if char == '{':
+                        bracket_level += 1
+                    elif char == '}':
+                        bracket_level -= 1
+                        if bracket_level == 0:
+                            json_end = i
+                            break
+
+            if json_end > 0:
+                json_str = content[start_idx:json_end + 1]
+
+                # Проверяем если это валидный JSON и содержит структуру курса
+                try:
+                    parsed = json.loads(json_str)
+                    # Проверяем, является ли это JSON-объектом курса (должен содержать lessons)
+                    if isinstance(parsed, dict) and 'lessons' in parsed:
+                        logger.info(f"Найдена структура курса в JSON объекте длиной {len(json_str)} символов")
+                        return json_str
+                    # Или если это массив уроков
+                    elif isinstance(parsed, list) and len(parsed) > 0 and \
+                         all(isinstance(item, dict) and 'title' in item for item in parsed):
+                        logger.info(f"Найден массив уроков в JSON объекте длиной {len(json_str)} символов")
+                        return json_str
+                    else:
+                        keys = list(parsed.keys()) if isinstance(parsed, dict) else "массив"
+                        logger.debug(f"JSON объект не содержит структуру курса. Ключи: {keys}")
+                except json.JSONDecodeError as e:
+                    logger.debug(f"Извлеченный объект не является валидным JSON: {str(e)}")
+
+        # Если не удалось найти валидный JSON курса, просто возвращаем исходный контент
+        # Это позволит методу _parse_json_safely попытаться исправить JSON
+        if content.strip().startswith('{') and content.strip().endswith('}'):
+            logger.warning("Не удалось найти структуру курса, но контент похож на JSON. Возвращаем исходный контент.")
+            return content
+
+        logger.warning("Структура курса не найдена в контенте")
+        return ""
+
+    async def _parse_json_safely(self, json_str: str) -> Dict[str, Any]:
+        """
+        Безопасно парсит JSON, пытаясь использовать стандартный парсер,
+        затем demjson3 для менее строгого парсинга, и в крайнем случае regex.
+
+        Args:
+            json_str: JSON-строка
+
+        Returns:
+            Dict[str, Any]: Словарь с данными или пустой словарь в случае ошибки
+        """
+        if not json_str or len(json_str.strip()) < 2:
+            logger.error("Получена пустая или слишком короткая JSON-строка")
+            return {}
+
+        # Логируем полный ответ API для отладки
+        logger.info("=== ПОЛНЫЙ ОТВЕТ API ДЛЯ ОТЛАДКИ ===")
+        json_length = len(json_str)
+        if json_length > 10000:
+            for i in range(0, json_length, 5000):
+                end_idx = min(i + 5000, json_length)
+                logger.info(f"JSON фрагмент {i//5000 + 1}/{(json_length//5000) + 1}: {json_str[i:end_idx]}")
+        else:
+            logger.info(f"JSON полностью: {json_str}")
+        logger.info("=== КОНЕЦ ПОЛНОГО ОТВЕТА API ===")
+
+        # 1. Попытка стандартного парсинга
+        try:
+            logger.info(f"Попытка стандартного парсинга JSON длиной {len(json_str)} символов")
+            start_chars = json_str[:50].replace('\n', '\\n')
+            end_chars = json_str[-50:].replace('\n', '\\n')
+            logger.info(f"Начало JSON: '{start_chars}...'")
+            logger.info(f"Конец JSON: '...{end_chars}'")
+            logger.info(f"ASCII коды первых 10 символов: {[ord(c) for c in json_str[:10]]}")
+            logger.info(f"ASCII коды последних 10 символов: {[ord(c) for c in json_str[-10:]]}")
+
+            parsed_json = json.loads(json_str)
+            logger.info("Стандартный парсинг JSON успешен")
+            if isinstance(parsed_json, dict):
+                logger.info(f"Структура JSON: объект с ключами {list(parsed_json.keys())}")
+                if 'lessons' in parsed_json and isinstance(parsed_json['lessons'], list):
+                    logger.info(f"Найдено {len(parsed_json['lessons'])} уроков")
+            elif isinstance(parsed_json, list):
+                logger.info(f"Структура JSON: массив длиной {len(parsed_json)}")
+            return parsed_json
+        except json.JSONDecodeError as e:
+            logger.error(f"Стандартный парсинг JSON не удался (строка {e.lineno}, колонка {e.colno}): {str(e)}")
+            logger.error("Контекст ошибки:")
+            lines = json_str.split('\n')
+            start_line = max(0, e.lineno - 3)
+            end_line = min(len(lines), e.lineno + 2)
+            context = '\n'.join(lines[start_line:end_line])
+            logger.error(context)
+            pos = e.pos
+            start_pos = max(0, pos - 20)
+            end_pos = min(len(json_str), pos + 20)
+            fragment = json_str[start_pos:end_pos].replace('\n', '\\n')
+            logger.error(f"Фрагмент вокруг ошибки (позиция {pos}): '{fragment}'")
+            # Переходим к следующему методу парсинга
+
+        # 2. Попытка парсинга с помощью demjson3 (если установлен)
+        if demjson3:
+            try:
+                logger.info("Попытка парсинга с помощью demjson3")
+                # Используем decode со строгим режимом=False для большей гибкости
+                parsed_demjson = demjson3.decode(json_str, strict=False)
+                logger.info("Парсинг с помощью demjson3 успешен")
+                if isinstance(parsed_demjson, dict):
+                     logger.info(f"Структура demjson: объект с ключами {list(parsed_demjson.keys())}")
+                     if 'lessons' in parsed_demjson and isinstance(parsed_demjson['lessons'], list):
+                         logger.info(f"Найдено {len(parsed_demjson['lessons'])} уроков")
+                elif isinstance(parsed_demjson, list):
+                     logger.info(f"Структура demjson: массив длиной {len(parsed_demjson)}")
+                return parsed_demjson
+            except demjson3.JSONDecodeError as dem_e:
+                logger.error(f"Парсинг с помощью demjson3 не удался: {str(dem_e)}")
+                # Переходим к следующему методу
+            except Exception as general_dem_e:
+                logger.error(f"Неожиданная ошибка при парсинге demjson3: {str(general_dem_e)}")
+                logger.error(f"Трассировка ошибки demjson3: {traceback.format_exc()}")
+                # Переходим к следующему методу
+        else:
+            logger.warning("Библиотека demjson3 не найдена. Пропускаем попытку парсинга с demjson3.")
+            logger.warning("Для улучшения обработки JSON рекомендуется установить: pip install demjson3")
+
+        # 3. Попытка извлечения данных с помощью регулярных выражений (последний вариант)
+        logger.info("Попытка извлечения данных из некорректного JSON с помощью регулярных выражений")
+        try:
+            result = self._extract_data_from_malformed_json(json_str)
+            if result and isinstance(result, dict) and ('lessons' in result or 'name' in result):
+                lesson_count = len(result.get('lessons', [])) if 'lessons' in result else 0
+                logger.info(f"Успешно создана базовая структура курса с {lesson_count} уроками из частичных данных")
+                return result
+            else:
+                 logger.error("Не удалось извлечь значимые данные с помощью регулярных выражений.")
+                 return {} # Возвращаем пустой словарь, если regex ничего не дал
+        except Exception as regex_e:
+             logger.error(f"Ошибка при извлечении данных с помощью регулярных выражений: {str(regex_e)}")
+             logger.error(f"Трассировка ошибки regex: {traceback.format_exc()}")
+             return {} # Возвращаем пустой словарь при ошибке в regex
+
+        # Если все методы не сработали
+        logger.error("Не удалось извлечь данные из JSON ни одним из методов.")
+        return {}
+
+    def _extract_data_from_malformed_json(self, json_str: str) -> Dict[str, Any]:
+        """
+        Извлекает данные из некорректного JSON с помощью регулярных выражений
+        (Остается без изменений, как вы предоставили)
+
+        Args:
+            json_str: Некорректный JSON
+
+        Returns:
+            Dict[str, Any]: Словарь с извлеченными данными
+        """
+        # Базовая структура курса
+        result = {
+            "name": "Course generated from partial data",
+            "description": "This course was automatically generated from partial data due to JSON parsing issues.",
+            "language": "english",
+            "level": "beginner",
+            "lessons": []
+        }
+
+        # Пробуем извлечь имя курса
+        name_match = re.search(r'"name"\s*:\s*"([^"]+)"', json_str)
+        if name_match:
+            result["name"] = name_match.group(1)
+
+        # Пробуем извлечь описание курса
+        desc_match = re.search(r'"description"\s*:\s*"([^"]+)"', json_str)
+        if desc_match:
+            result["description"] = desc_match.group(1)
+
+        # Пробуем извлечь уровень
+        level_match = re.search(r'"level"\s*:\s*"([^"]+)"', json_str)
+        if level_match:
+            result["level"] = level_match.group(1)
+
+        # Пробуем извлечь язык
+        lang_match = re.search(r'"language"\s*:\s*"([^"]+)"', json_str)
+        if lang_match:
+            result["language"] = lang_match.group(1)
+
+        # Пробуем найти уроки - ищем структуры, похожие на уроки
+        # Улучшенный паттерн, чтобы захватывать больше контекста и быть менее жадным
+        lesson_pattern = r'{\s*"title"\s*:\s*"([^"]+)"(?:.*?"objectives"\s*:\s*\[(.*?)\])?(?:.*?"grammar"\s*:\s*\[(.*?)\])?(?:.*?"vocabulary"\s*:\s*\[(.*?)\])?.*?}'
+        lesson_matches = re.finditer(lesson_pattern, json_str, re.DOTALL | re.IGNORECASE)
+
+        lessons_extracted = []
+        for i, match in enumerate(lesson_matches, 1):
+            title = match.group(1)
+            objectives_str = match.group(2) or ""
+            grammar_str = match.group(3) or ""
+            vocabulary_str = match.group(4) or ""
+
+            #Создаем базовую структуру урока
+            lesson = {
+                    "title": title,
+                    "order": i,
+                    "objectives": self._extract_array_items(objectives_str),
+                    "grammar": self._extract_array_items(grammar_str),
+                    "vocabulary": self._extract_array_items(vocabulary_str),
+                    "homework": {},
+                    "duration": 60,  # Значение по умолчанию
+                    "activities": [],
+                    "description": f"Lesson {i}: {title}", # Default description
+                    "procedure": [ # Default procedure
+                        "Introduction to the topic",
+                        "Grammar explanation",
+                        "Vocabulary practice",
+                        "Communication activities",
+                        "Homework assignment"
+                    ],
+                    "materials": ["Textbook", "Workbook", "Audio recordings"] # Default materials
+                }
+
+            # Попробуем найти другие поля внутри блока урока (менее надежно)
+            lesson_block_match = match.group(0) # Весь блок урока
+
+            # Извлечь описание урока, если есть
+            lesson_desc_match = re.search(r'"description"\s*:\s*"([^"]+)"', lesson_block_match, re.DOTALL | re.IGNORECASE)
+            if lesson_desc_match:
+                lesson["description"] = lesson_desc_match.group(1)
+            else:
+                 logger.info(f"Добавлено стандартное поле 'description' для урока {i}")
+
+
+            # Извлечь homework
+            homework_match = re.search(r'"homework"\s*:\s*{(.*?)}', lesson_block_match, re.DOTALL | re.IGNORECASE)
+            if homework_match:
+                 homework_content = homework_match.group(1)
+                 hw_desc_match = re.search(r'"description"\s*:\s*"([^"]+)"', homework_content)
+                 hw_tasks_match = re.search(r'"tasks"\s*:\s*\[(.*?)\]', homework_content, re.DOTALL)
+                 hw_time_match = re.search(r'"estimatedTime"\s*:\s*(\d+)', homework_content)
+                 estimated_time = int(hw_time_match.group(1)) if hw_time_match and int(hw_time_match.group(1)) > 0 else 30
+
+                 lesson["homework"] = {
+                     "description": hw_desc_match.group(1) if hw_desc_match else f"Homework for lesson {i}",
+                     "tasks": self._extract_array_items(hw_tasks_match.group(1) if hw_tasks_match else ""),
+                     "estimatedTime": estimated_time
+                 }
+            else:
+                # Создаем стандартное домашнее задание
+                logger.info(f"Добавлено стандартное поле 'homework' для урока {i}")
+                lesson["homework"] = {
+                    "description": f"Homework for lesson {i}",
+                    "tasks": ["Review the material", "Complete exercises", "Prepare for the next lesson"],
+                    "estimatedTime": 30
+                }
+
+            # Извлечь duration
+            duration_match = re.search(r'"duration"\s*:\s*(\d+)', lesson_block_match, re.IGNORECASE)
+            if duration_match:
+                duration = int(duration_match.group(1))
+                if duration > 0:
+                    lesson["duration"] = duration
+                else:
+                    logger.warning(f"Извлечена некорректная продолжительность урока: {duration} для урока '{title}'. Установлено значение по умолчанию: 60 минут")
+
+            # Извлечь materials
+            materials_match = re.search(r'"materials"\s*:\s*\[(.*?)\]', lesson_block_match, re.DOTALL | re.IGNORECASE)
+            if materials_match:
+                 lesson["materials"] = self._extract_array_items(materials_match.group(1))
+            else:
+                 logger.info(f"Добавлено стандартное поле 'materials' для урока {i}")
+
+
+            # Извлечь activities
+            activities_match = re.search(r'"activities"\s*:\s*\[(.*?)\]', lesson_block_match, re.DOTALL | re.IGNORECASE)
+            if activities_match:
+                activities_content = activities_match.group(1)
+                # Упрощенное извлечение активностей
+                activity_pattern = r'{\s*"name"\s*:\s*"([^"]+)"(?:.*?"type"\s*:\s*"([^"]+)")?.*?}'
+                activity_matches = re.finditer(activity_pattern, activities_content, re.DOTALL | re.IGNORECASE)
+                lesson_activities = []
+                for act_match in activity_matches:
+                    activity = {
+                        "name": act_match.group(1),
+                        "type": act_match.group(2) or "practice", # Default type
+                        "duration": 15,  # Default duration
+                        "description": f"Activity: {act_match.group(1)}", # Default description
+                        "materials": [] # Default materials
+                    }
+                    # Попробуем найти duration и description для активности
+                    activity_block = act_match.group(0)
+                    act_desc_match = re.search(r'"description"\s*:\s*"([^"]+)"', activity_block, re.IGNORECASE)
+                    act_dur_match = re.search(r'"duration"\s*:\s*(\d+)', activity_block, re.IGNORECASE)
+                    if act_desc_match: activity["description"] = act_desc_match.group(1)
+                    if act_dur_match and int(act_dur_match.group(1)) > 0: activity["duration"] = int(act_dur_match.group(1))
+
+                    lesson_activities.append(activity)
+                lesson["activities"] = lesson_activities
+
+            # Если нет активностей, добавим одну базовую
+            if not lesson["activities"]:
+                 logger.info(f"Добавлено стандартное поле 'activities' для урока {i}")
+                 lesson["activities"] = [{
+                    "name": "Default activity",
+                    "type": "practice",
+                    "duration": lesson.get("duration", 60) - 15 if lesson.get("duration", 60) > 15 else 45, # Попробуем занять оставшееся время
+                    "description": "General practice of the lesson material",
+                    "materials": []
+                }]
+
+            lessons_extracted.append(lesson)
+
+        result["lessons"] = lessons_extracted
+
+        if result["lessons"]:
+            logger.info(f"Создан словарь с массивом в поле lessons, уроков: {len(result['lessons'])}")
+        else:
+            logger.warning("Не удалось извлечь ни одного урока из JSON с помощью regex")
+            # Создаем один базовый урок, если regex не нашел уроков
+            logger.info("Создан базовый урок, так как не удалось извлечь данные из JSON")
+            result["lessons"] = [{
+                "title": "Lesson 1: Introduction",
+                "order": 1,
+                "description": "Introduction to the course material",
+                "objectives": ["Learn basic concepts", "Develop initial skills", "Get familiar with materials"],
+                "grammar": ["Basic grammar", "Simple structures"],
+                "vocabulary": ["Essential vocabulary", "Common phrases"],
+                "procedure": ["Introduction", "Main activity", "Practice", "Conclusion"],
+                "materials": ["Textbook", "Workbook", "Audio recordings"],
+                "homework": {
+                    "description": "Practice basic skills",
+                    "tasks": ["Review materials", "Complete exercises", "Prepare for next lesson"],
+                    "estimatedTime": 30
+                },
+                "duration": 60,
+                "activities": [{
+                    "name": "Introduction to the topic",
+                    "type": "presentation",
+                    "duration": 20,
+                    "description": "Presentation of the main concepts",
+                    "materials": []
+                }, {
+                    "name": "Practice exercises",
+                    "type": "practice",
+                    "duration": 40,
+                    "description": "Practical exercises to reinforce learning",
+                    "materials": []
+                }]
+            }]
+        return result
+
+    def _extract_array_items(self, array_str: str) -> List[str]:
+        """
+        Извлекает элементы массива из строки JSON
+        (Остается без изменений, как вы предоставили)
+
+        Args:
+            array_str: Строка с элементами массива
+
+        Returns:
+            List[str]: Список извлеченных элементов
+        """
+        if not array_str:
+             return ["Item 1", "Item 2", "Item 3"] # Возвращаем дефолт, если строка пустая
+        # Ищем все строки в кавычках, учитывая возможные экранированные кавычки
+        items = re.findall(r'"((?:\\.|[^"\\])*)"', array_str)
+        # Очищаем от возможных пустых строк после разделения
+        cleaned_items = [item.strip() for item in items if item.strip()]
+        return cleaned_items if cleaned_items else ["Item 1", "Item 2", "Item 3"]
+
+    def _generate_fallback_structure(self, prompt: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Генерирует базовую структуру курса в случае ошибок
+
+        Args:
+            prompt: Промпт для генерации
+
+        Returns:
+            Dict[str, Any]: Запасная структура курса
+        """
+        context = prompt.get('context', {})
+        course_name = context.get('course_name', 'Новый курс')
+        language = context.get('language', 'english')
+        level = context.get('level', 'beginner')
+        target_level = context.get('level', 'beginner')
+        start_level = context.get('start_level', level)
+        target_audience = context.get('target_audience', 'adults')
+        lessons_count = int(context.get('lessons_count', 12))
+
+        logger.info(f"Создание запасной структуры курса с {lessons_count} уроками")
+
+        # Базовые темы для уроков начального уровня
+        beginner_topics = [
+            "Знакомство и приветствия",
+            "Семья и родственники",
+            "Числа и счет",
+            "Время и даты",
+            "Еда и рестораны",
+            "Дом и мебель",
+            "Город и ориентирование на местности",
+            "Покупки и магазины",
+            "Погода и времена года",
+            "Хобби и свободное время",
+            "Путешествия и транспорт",
+            "Здоровье и тело человека"
+        ]
+
+        # Базовые темы для среднего уровня
+        intermediate_topics = [
+            "Образование и карьера",
+            "Технологии и интернет",
+            "Искусство и культура",
+            "Окружающая среда и экология",
+            "Новости и СМИ",
+            "Личные отношения",
+            "Социальные вопросы",
+            "Спорт и физическая активность",
+            "Празднования и обычаи",
+            "Наука и исследования",
+            "Бизнес и экономика",
+            "Проблемы современного общества"
+        ]
+
+        # Базовые темы для продвинутого уровня
+        advanced_topics = [
+            "Глобальные проблемы человечества",
+            "Философия и этика",
+            "Литература и критическое мышление",
+            "Международные отношения",
+            "Психология и поведение человека",
+            "Дебаты и аргументация",
+            "Современное искусство",
+            "Научные достижения",
+            "Межкультурная коммуникация",
+            "История и цивилизации",
+            "Финансы и инвестиции",
+            "Профессиональное развитие"
+        ]
+
+        # Выбираем темы в зависимости от уровня
+        if level.lower() in ['advanced', 'c1', 'c2', 'proficiency']:
+            topics = advanced_topics
+        elif level.lower() in ['intermediate', 'b1', 'b2']:
+            topics = intermediate_topics
+        else:
+            topics = beginner_topics
+
+        # Обеспечиваем достаточное количество тем для уроков
+        while len(topics) < lessons_count:
+            topics += topics
+
+        lessons = []
+        for i in range(lessons_count):
+            # Формируем название и номер урока с учетом темы
+            topic = topics[i % len(topics)]
+            title = f"Урок {i+1}: {topic}"
+
+            # Базовые цели обучения, связанные с темой
+            objectives = [
+                f"Изучить новую лексику по теме \"{topic}\"",
+                f"Освоить грамматические конструкции уровня {level}",
+                f"Развить навыки говорения по теме \"{topic}\"",
+                f"Улучшить навыки аудирования в контексте \"{topic.lower()}\""
+            ]
+
+            # Создаем описание урока - это обязательное поле!
+            description = f"Урок {i+1} посвящен теме \"{topic}\". Студенты изучат новую лексику, грамматические конструкции и разовьют коммуникативные навыки в контексте данной темы. Урок включает разнообразные активности для тренировки всех языковых навыков: чтения, письма, говорения и аудирования."
+
+            # Генерируем типичные активности для урока
+            activities = [
+                {
+                    "name": "Разминка",
+                    "type": "warm-up",
+                    "duration": 10,
+                    "description": f"Короткое обсуждение предыдущих знаний по теме \"{topic}\"",
+                    "materials": ["Карточки с вопросами", "Доска"]
+                },
+                {
+                    "name": "Введение новой лексики",
+                    "type": "vocabulary",
+                    "duration": 15,
+                    "description": f"Презентация и отработка новых слов и выражений по теме \"{topic}\"",
+                    "materials": ["Картинки", "Презентация", "Раздаточный материал"]
+                },
+                {
+                    "name": "Грамматическая практика",
+                    "type": "grammar",
+                    "duration": 15,
+                    "description": "Объяснение грамматического материала и выполнение упражнений",
+                    "materials": ["Учебник", "Грамматические таблицы", "Рабочая тетрадь"]
+                },
+                {
+                    "name": "Разговорная практика",
+                    "type": "speaking",
+                    "duration": 15,
+                    "description": f"Выполнение коммуникативных заданий по теме \"{topic}\"",
+                    "materials": ["Ситуационные карточки", "Ролевые карточки"]
+                },
+                {
+                    "name": "Заключение",
+                    "type": "summary",
+                    "duration": 5,
+                    "description": "Подведение итогов урока и объяснение домашнего задания",
+                    "materials": ["Доска", "Раздаточный материал с домашним заданием"]
+                }
+            ]
+
+            # Формируем домашнее задание как список задач
+            homework_tasks = [
+                f"Выполнить упражнения в рабочей тетради (стр. {(i+1)*2}-{(i+1)*2+2})",
+                f"Выучить новые слова по теме \"{topic}\"",
+                f"Подготовить монолог/диалог на тему \"{topic}\""
+            ]
+
+            # Преобразуем в формат словаря, соответствующий схеме
+            homework = {
+                "description": f"Домашнее задание для закрепления темы \"{topic}\"",
+                "tasks": homework_tasks,
+                "estimatedTime": 30
+            }
+
+            # Формируем список грамматических тем в зависимости от уровня
+            if level.lower() in ['beginner', 'a1', 'a2', 'elementary']:
+                grammar = [
+                    "Личные и притяжательные местоимения",
+                    "Простое настоящее время (Present Simple)",
+                    "Настоящее продолженное время (Present Continuous)",
+                    "Модальные глаголы can/could"
+                ]
+            elif level.lower() in ['intermediate', 'b1', 'b2']:
+                grammar = [
+                    "Прошедшие времена (Past Simple, Past Continuous, Past Perfect)",
+                    "Условные предложения (Conditionals) I и II типа",
+                    "Страдательный залог (Passive Voice)",
+                    "Косвенная речь (Reported Speech)"
+                ]
+            else:  # Advanced
+                grammar = [
+                    "Сложные временные формы",
+                    "Условные предложения смешанного типа",
+                    "Инверсия и эмфатические конструкции",
+                    "Сложные предложные и фразовые обороты"
+                ]
+
+            # Формируем список словарного запаса в зависимости от темы урока
+            vocabulary = [f"{topic}: базовая лексика", f"{topic}: идиомы и выражения", f"{topic}: ситуативная лексика"]
+
+            # Формируем базовый урок
+            lesson = {
+                "title": title,
+                "description": description,
+                "objectives": objectives,
+                "grammar": grammar,
+                "vocabulary": vocabulary,
+                "procedure": [
+                    "Вводная часть (5-10 минут): приветствие, проверка домашнего задания, знакомство с темой урока",
+                    "Презентация нового материала (15 минут): объяснение новой лексики и грамматики",
+                    "Практика понимания (10 минут): упражнения на понимание и применение нового материала",
+                    "Коммуникативная практика (15 минут): диалоги, ролевые игры, дискуссии",
+                    "Заключение (5-10 минут): обзор изученного материала, объяснение домашнего задания"
+                ],
+                "activities": activities,
+                "materials": ["Учебник", "Рабочая тетрадь", "Аудиоматериалы", "Презентация", "Раздаточный материал"],
+                "homework": homework,
+                "duration": 60,  # Устанавливаем положительное значение продолжительности
+                "order": i+1
+            }
+
+            lessons.append(lesson)
+
+        # Формируем структуру курса
+        course_description = f"Курс изучения {language} языка для перехода с уровня {start_level} на уровень {target_level}. Курс разработан для {target_audience} и включает {lessons_count} интерактивных уроков с широким набором коммуникативных упражнений и заданий для развития всех языковых навыков."
+
+        course_structure = {
+            "name": course_name,
+            "description": course_description,
+            "language": language,
+            "level": level,
+            "start_level": start_level,
+            "target_audience": target_audience,
+            "lessons": lessons,
+            "prerequisites": ["Базовые знания языка (если требуются)", "Доступ к учебным материалам"],
+            "learning_outcomes": [
+                "Развитие навыков устной речи",
+                "Расширение словарного запаса",
+                "Улучшение понимания грамматики",
+                "Повышение уровня владения языком"
+            ]
+        }
+
+        logger.info(f"Создана запасная структура курса с {len(lessons)} уроками")
+        return course_structure
+
+    def _generate_default_value(self, field: str, prompt: Dict[str, Any]) -> Any:
+        """
+        Генерирует значение по умолчанию для заданного поля
+
+        Args:
+            field: Имя поля
+            prompt: Исходный промпт
+
+        Returns:
+            Any: Значение по умолчанию
+        """
+        context = prompt['context']
+
+        if field == 'name':
+            return context['course_name']
+        elif field == 'description':
+            return "Курс изучения {0} языка для {1} {2} уровня".format(
+                context['language'],
+                context['target_audience'],
+                context['level']
+            )
+        elif field == 'lessons':
+            return self._generate_default_lessons(prompt)
+        elif field in ['prerequisites', 'learning_outcomes']:
+            return []
+
+        return ""
+
+    def _generate_default_lessons(self, prompt: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Генерирует базовый набор уроков
+
+        Args:
+            prompt: Исходный промпт
+
+        Returns:
+            List[Dict[str, Any]]: Список уроков
+        """
+        context = prompt['context']
+        lessons_count = min(context.get('lessons_count', 10), 20)  # Не более 20 уроков
+        lesson_duration = context.get('lesson_duration', 60)
+
+        lessons = []
+
+        for i in range(1, lessons_count + 1):
+            lesson = {
+                "title": "Урок {0}".format(i),
+                "objectives": ["Изучение новой темы"],
+                "grammar": [],
+                "vocabulary": [],
+                "duration": lesson_duration,
+                "procedure": [
+                    "Вводная часть (10 минут): знакомство с темой урока",
+                    "Презентация нового материала (15 минут): объяснение ключевых понятий",
+                    "Практика (20 минут): упражнения для закрепления",
+                    "Разговорная практика (10 минут): применение изученного в общении",
+                    "Заключение (5 минут): обзор изученного материала"
+                ],
+                "activities": [
+                    {
+                        "name": "Введение в тему",
+                        "type": "warm-up",
+                        "duration": 10,
+                        "description": "Вводное упражнение для ознакомления с темой урока",
+                        "materials": [],
+                        "objectives": []
+                    },
+                    {
+                        "name": "Основная часть",
+                        "type": "practice",
+                        "duration": lesson_duration - 20,
+                        "description": "Основные упражнения урока",
+                        "materials": [],
+                        "objectives": []
+                    },
+                    {
+                        "name": "Закрепление",
+                        "type": "production",
+                        "duration": 10,
+                        "description": "Закрепление изученного материала",
+                        "materials": [],
+                        "objectives": []
+                    }
+                ],
+                "materials": [],
+                "homework": {
+                    "description": "Домашнее задание для закрепления материала урока {0}".format(i),
+                    "tasks": ["Повторение изученного материала", "Выполнение практических заданий"],
+                    "estimatedTime": 30
+                }
+            }
+            lessons.append(lesson)
+
+        return lessons
+
+    def _create_cache_key(self, prompt: str, content_type: ContentType, extra_params: Optional[Dict[str, Any]] = None) -> str:
+        """
+        Создает уникальный ключ для кэширования на основе промпта и параметров
+
+        Args:
+            prompt: Текст промпта
+            content_type: Тип контента
+            extra_params: Дополнительные параметры для генерации
+
+        Returns:
+            str: Ключ для кэширования
+        """
+        # Создаем хэш промпта
+        prompt_hash = hashlib.md5(prompt.encode()).hexdigest()
+
+        # Если есть дополнительные параметры, добавляем их хэш
+        params_hash = ""
+        if extra_params:
+            # Преобразуем в отсортированный JSON для стабильного хэширования
+            try:
+                params_str = json.dumps(extra_params, sort_keys=True, default=str)
+                params_hash = ":{0}".format(hashlib.md5(params_str.encode()).hexdigest()[:8])
+            except:
+                # Если не удалось сериализовать параметры, игнорируем их
+                pass
+
+        # Формируем итоговый ключ
+        content_type_str = content_type.value if hasattr(content_type, 'value') else str(content_type)
+        return "content:{0}:{1}{2}".format(content_type_str, prompt_hash, params_hash)
+
+    async def _fix_json_with_llm(self, problematic_json: str) -> str:
+        """
+        Использовать LLM для исправления проблемного JSON
+
+        Args:
+            problematic_json: Проблемный JSON, который не удалось распарсить стандартными методами
+
+        Returns:
+            str: Исправленный JSON или пустая строка, если не удалось исправить
+        """
+        try:
+            logger.info("Попытка исправления JSON с помощью LLM")
+
+            # Формируем промпт для LLM
+            prompt = """
+            У меня есть неправильно отформатированный JSON, который не удается распарсить.
+            Пожалуйста, исправь все проблемы и верни только корректно отформатированный JSON без дополнительных пояснений.
+
+            Проблемный JSON:
+            ```
+            {0}
+            ```
+
+            Исправленный JSON (только JSON, без пояснений):
+            """
+
+            # Применяем форматирование
+            prompt = prompt.format(problematic_json)
+
+            # Отправляем промпт с инструкцией возвращать только JSON
+            content = await self.generate_content(
+                user_id=0,  # Системная генерация
+                prompt=prompt,
+                content_type=ContentType.STRUCTURED_DATA,
+                force_queue=False,  # Требуется быстрый ответ
+                extra_params={"format": "json", "task": "fix_json", "max_tokens": 4000}
+            )
+
+            if not content:
+                logger.error("LLM вернула пустой результат при исправлении JSON")
+                return ""
+
+            # Очищаем результат от лишних блоков форматирования и получаем JSON
+            content = self._clean_json_response(content)
+            json_str = self._extract_json_from_content(content)
+
+            if not json_str:
+                logger.error("Не удалось извлечь исправленный JSON из ответа LLM")
+                return ""
+
+            # Проверяем, что получился валидный JSON
+            try:
+                json.loads(json_str)
+                logger.info("LLM успешно исправила JSON")
+                return json_str
+            except json.JSONDecodeError as e:
+                logger.error(f"LLM не смогла полностью исправить JSON: {str(e)}")
+                return ""
+
+        except Exception as e:
+            logger.error(f"Ошибка при попытке исправить JSON с помощью LLM: {str(e)}")
+            return ""
+
+    def _enrich_lesson_data(self, lesson: dict, index: int) -> dict:
+        """
+        Обогащает данные урока недостающими полями.
+
+        Args:
+            lesson: Исходные данные урока
+            index: Номер урока
+
+        Returns:
+            Обогащенный словарь урока с обязательными полями
+        """
+        # Создаем копию для изменения
+        enriched = lesson.copy()
+
+        # Обязательные поля для урока
+        required_fields = {
+            "title": "Урок {0}".format(index),
+            "description": "Описание урока {0}".format(index),
+            "objectives": [],
+            "materials": [],
+            "vocabulary": [],
+            "grammar": [],
+            "procedure": [],
+            "homework": {
+                "description": "Домашнее задание для урока {0}".format(index),
+                "tasks": ["Выполнить упражнения по теме урока"],
+                "estimatedTime": 30
+            }
+        }
+
+        # Заполняем недостающие поля
+        for field, default_value in required_fields.items():
+            if field not in enriched or not enriched[field]:
+                enriched[field] = default_value
+                logger.info("Добавлено недостающее поле '{0}' для урока {1}".format(field, index))
+
+        # Если есть поля типа procedure, objectives и т.д., но они строки, преобразуем их в списки
+        fields_to_check = ["objectives", "materials", "vocabulary", "grammar", "procedure"]
+        for field in fields_to_check:
+            if field in enriched and isinstance(enriched[field], str):
+                # Пытаемся разделить строку на абзацы или пункты
+                parts = [part.strip() for part in enriched[field].split('\n') if part.strip()]
+                if not parts:  # Если после разделения список пустой
+                    parts = [enriched[field]]  # Используем всю строку как один элемент
+                enriched[field] = parts
+                logger.info("Преобразовано поле '{0}' из строки в список для урока {1}".format(field, index))
+
+        # КРИТИЧЕСКИ ВАЖНОЕ ИСПРАВЛЕНИЕ: гарантируем, что homework всегда будет словарем в соответствии со схемой
+        if "homework" in enriched:
+            # Если homework не является словарем, преобразуем его
+            if not isinstance(enriched["homework"], dict):
+                # Сохраняем оригинальные задания
+                original_homework = enriched["homework"]
+
+                # Создаем правильную структуру словаря
+                homework_dict = {
+                    "description": f"Домашнее задание для урока {index}",
+                    "tasks": [],
+                    "estimatedTime": 30
+                }
+
+                # Преобразуем исходное значение в список задач
+                if isinstance(original_homework, list):
+                    # Если это уже список, используем его как tasks
+                    homework_dict["tasks"] = [str(item) for item in original_homework]
+                elif isinstance(original_homework, str):
+                    # Если это строка, разбиваем ее на отдельные задания
+                    items = [item.strip() for item in original_homework.split('\n') if item.strip()]
+                    homework_dict["tasks"] = items if items else [original_homework]
+                else:
+                    # Если что-то совсем непонятное, создаем задание по умолчанию
+                    homework_dict["tasks"] = ["Выполнить упражнения по теме урока"]
+
+                enriched["homework"] = homework_dict
+                logger.info(f"Преобразовано поле 'homework' в правильный формат словаря для урока {index}")
+            else:
+                # Проверяем наличие необходимых полей в уже существующем словаре homework
+                if "description" not in enriched["homework"] or not enriched["homework"]["description"]:
+                    enriched["homework"]["description"] = f"Домашнее задание для урока {index}"
+
+                if "tasks" not in enriched["homework"] or not enriched["homework"]["tasks"]:
+                    enriched["homework"]["tasks"] = ["Выполнить упражнения по теме урока"]
+
+                # Гарантируем, что tasks - это список
+                if not isinstance(enriched["homework"]["tasks"], list):
+                    if isinstance(enriched["homework"]["tasks"], str):
+                        enriched["homework"]["tasks"] = [enriched["homework"]["tasks"]]
+                    else:
+                        enriched["homework"]["tasks"] = [str(enriched["homework"]["tasks"])]
+
+                # Гарантируем, что estimatedTime существует и положительный
+                if "estimatedTime" not in enriched["homework"] or not isinstance(enriched["homework"]["estimatedTime"], (int, float)) or enriched["homework"]["estimatedTime"] <= 0:
+                    enriched["homework"]["estimatedTime"] = 30
+
+        # Добавляем поле 'order' если его нет
+        if 'order' not in enriched:
+            enriched['order'] = index
+
+        # Проверяем, что duration > 0
+        if 'duration' not in enriched or not enriched['duration'] or enriched['duration'] <= 0:
+            enriched['duration'] = 60  # Значение по умолчанию - 60 минут
+            logger.info("Установлено положительное значение продолжительности для урока {0}".format(index))
+
+        return enriched

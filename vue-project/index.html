@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, minimum-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta name="format-detection" content="telephone=no">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="MobileOptimized" content="176">
+    <meta name="HandheldFriendly" content="True">
+    <meta name="robots" content="noindex, nofollow">
+    <title>LMS Platform</title>
+
+    <!-- Предзагрузка критических JS -->
+    <link rel="modulepreload" href="/src/main.ts">
+    
+    <!-- Явно подключаем стили -->
+    <link rel="stylesheet" href="/src/assets/main.css">
+    <link rel="stylesheet" href="/src/assets/css/global.css">
+
+    <!-- Подключаем скрипт Telegram WebApp -->
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    
+    <!-- Упрощенные глобальные стили для решения проблемы с черным блоком Telegram -->
+    <style>
+        /* Упрощенные базовые стили документа */
+        html, body {
+            margin: 0 !important;
+            padding: 0 !important;
+            overflow-x: hidden !important;
+            width: 100% !important;
+            height: 100% !important;
+            min-height: 100vh !important;
+            background-color: #1c0522 !important;
+            color: #fff !important;
+        }
+        
+        /* Стили корневого контейнера приложения */
+        #app {
+            width: 100% !important;
+            min-height: 100vh !important;
+            margin: 0 !important;
+            padding: 0 !important;
+            background-color: #1c0522 !important;
+            display: block !important;
+            visibility: visible !important;
+            opacity: 1 !important;
+        }
+        
+        /* Фоновое изображение */
+        .global-background {
+            background-attachment: fixed !important;
+            background-size: cover !important;
+            background-position: center !important;
+            min-height: 100vh !important;
+        }
+        
+        /* Все элементы используют box-sizing: border-box */
+        * {
+            box-sizing: border-box !important;
+        }
+        
+        /* Стили для прелоадера */
+        .app-preloader {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: #1c0522;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            z-index: 9999;
+        }
+        
+        .app-preloader__spinner {
+            width: 50px;
+            height: 50px;
+            border: 5px solid rgba(255, 255, 255, 0.3);
+            border-radius: 50%;
+            border-top-color: #fff;
+            animation: spin 1s ease-in-out infinite;
+            margin-bottom: 20px;
+        }
+        
+        .app-preloader__text {
+            color: #fff;
+            font-size: 18px;
+            text-align: center;
+        }
+        
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+    </style>
+    <script>
+        // Функция для принудительного включения стилей
+        function enableAllStyles() {
+            console.log('Принудительное включение всех стилей...');
+            
+            // Включаем все CSS-файлы
+            var styleLinks = document.querySelectorAll('link[rel="stylesheet"]');
+            for (var i = 0; i < styleLinks.length; i++) {
+                styleLinks[i].disabled = false;
+            }
+            
+            // Включаем все style-элементы
+            var styleElements = document.querySelectorAll('style');
+            for (var j = 0; j < styleElements.length; j++) {
+                styleElements[j].disabled = false;
+            }
+            
+            console.log('Все стили включены');
+        }
+        
+        // Запускаем включение стилей при загрузке страницы
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', enableAllStyles);
+        } else {
+            enableAllStyles();
+        }
+        
+        // Также запускаем включение стилей после полной загрузки страницы
+        window.addEventListener('load', enableAllStyles);
+        
+        // Глобальная функция очистки DOM от мусорных контейнеров
+        window.cleanupDOM = function() {
+            console.log("Выполняем глобальную очистку DOM...");
+            
+            // Проверяем, находимся ли мы на странице lesson-plan
+            const currentPath = window.location.pathname;
+            const isLessonPlanPage = currentPath.includes('lesson-plan');
+            
+            // Проверяем, есть ли у body класс has-lesson-plan
+            const hasLessonPlan = document.body.classList.contains('has-lesson-plan');
+            
+            if (!isLessonPlanPage) {
+                // Если мы не на странице lesson-plan, удаляем только элементы, связанные с ней
+                const selectors = [
+                    '.lesson-plan-container',
+                    '[data-component="lesson-plan"]',
+                    '.simple-toast-container',
+                    '.planet-background',
+                    '.lesson-plan-heading',
+                    '.lesson-plan-subheading',
+                    '.lesson-plan-paragraph',
+                    '.lesson-plan-list',
+                    '.lesson-plan-list-item',
+                    '.lesson-plan-section-header',
+                    '.lesson-plan-bold',
+                    '.lesson-plan-italic',
+                    '.lesson-plan-empty-paragraph'
+                ];
+                
+                selectors.forEach(selector => {
+                    const elements = document.querySelectorAll(selector);
+                    console.log(`Найдено ${elements.length} элементов по селектору ${selector}`);
+                    
+                    elements.forEach(el => {
+                        // Если элемент не является частью основной навигации
+                        if (!el.classList.contains('bottom-navigation') && 
+                            !el.closest('.bottom-navigation') &&
+                            !el.classList.contains('dialog') && 
+                            !el.classList.contains('modal') &&
+                            !el.closest('.dialog') && 
+                            !el.closest('.modal')) {
+                            
+                            try {
+                                // ВАЖНО: Только скрываем элемент, но не удаляем его
+                                // Это предотвращает ошибку "Cannot read properties of null (reading 'insertBefore')"
+                                if (el instanceof HTMLElement) {
+                                  el.style.display = 'none';
+                                  el.style.visibility = 'hidden';
+                                  el.style.opacity = '0';
+                                  el.style.pointerEvents = 'none';
+                                  el.style.zIndex = '-9999';
+                                  el.style.position = 'absolute';
+                                  el.style.left = '-9999px';
+                                  el.style.top = '-9999px';
+                                  el.style.width = '0';
+                                  el.style.height = '0';
+                                  el.style.overflow = 'hidden';
+                                  console.log(`Скрыт элемент ${selector}`);
+                                }
+                            } catch (err) {
+                                console.error(`Ошибка при скрытии элемента ${selector}:`, err);
+                            }
+                        }
+                    });
+                });
+                
+                // Удаляем класс has-lesson-plan у body, если он есть
+                if (hasLessonPlan) {
+                    document.body.classList.remove('has-lesson-plan');
+                    console.log('Удален класс has-lesson-plan у body');
+                }
+                
+                // Дополнительная проверка на наличие элементов с атрибутами, связанными с LessonPlan
+                const attributeSelectors = [
+                    '[class*="lesson-plan-"]',
+                    '[id*="lesson-plan-"]',
+                    '[data-*="lesson-plan"]'
+                ];
+                
+                attributeSelectors.forEach(selector => {
+                    try {
+                        const elements = document.querySelectorAll(selector);
+                        if (elements.length > 0) {
+                            console.log(`Найдено ${elements.length} элементов по селектору ${selector}`);
+                            elements.forEach(el => {
+                                // Скрываем элемент, но не удаляем, чтобы избежать ошибок
+                                if (el instanceof HTMLElement) {
+                                  el.style.display = 'none';
+                                  el.style.visibility = 'hidden';
+                                  el.style.opacity = '0';
+                                  el.style.pointerEvents = 'none';
+                                  el.style.zIndex = '-9999';
+                                  console.log(`Скрыт элемент ${selector}`);
+                                }
+                            });
+                        }
+                    } catch (err) {
+                        console.error(`Ошибка при поиске элементов по селектору ${selector}:`, err);
+                    }
+                });
+            }
+            
+            // Проверяем, существует ли router-view
+            const routerView = document.querySelector('router-view');
+            if (!routerView) {
+                console.log("router-view не найден, создаем новый");
+                const appElement = document.querySelector('#app');
+                if (appElement) {
+                    const newRouterView = document.createElement('router-view');
+                    appElement.appendChild(newRouterView);
+                    console.log("router-view создан и добавлен в #app");
+                }
+            }
+            
+            // Восстанавливаем видимость основных элементов
+            setTimeout(() => {
+                // Восстанавливаем видимость router-view
+                const routerView = document.querySelector('router-view');
+                if (routerView) {
+                    routerView.style.display = 'block';
+                    routerView.style.opacity = '1';
+                    routerView.style.visibility = 'visible';
+                    routerView.style.position = 'relative';
+                    routerView.style.zIndex = '5';
+                } else {
+                    console.log("router-view все еще не найден, пытаемся создать снова");
+                    const appElement = document.querySelector('#app');
+                    if (appElement) {
+                        const newRouterView = document.createElement('router-view');
+                        appElement.appendChild(newRouterView);
+                        console.log("router-view создан повторно");
+                        
+                        // Устанавливаем стили для нового router-view
+                        newRouterView.style.display = 'block';
+                        newRouterView.style.opacity = '1';
+                        newRouterView.style.visibility = 'visible';
+                        newRouterView.style.position = 'relative';
+                        newRouterView.style.zIndex = '5';
+                    }
+                }
+                
+                // Восстанавливаем видимость main
+                const main = document.querySelector('main');
+                if (main) {
+                    main.style.display = 'block';
+                    main.style.opacity = '1';
+                    main.style.visibility = 'visible';
+                    main.style.zIndex = '1';
+                }
+                
+                // Восстанавливаем видимость main-content-container
+                const mainContent = document.querySelector('.main-content-container');
+                if (mainContent) {
+                    // Проверяем, не остались ли внутри элементы lesson-plan
+                    const nestedLessonPlans = mainContent.querySelectorAll('.lesson-plan-container, [data-component="lesson-plan"]');
+                    if (nestedLessonPlans.length > 0) {
+                        console.log(`Найдены вложенные элементы lesson-plan: ${nestedLessonPlans.length}`);
+                        nestedLessonPlans.forEach(el => {
+                            try {
+                                // ВАЖНО: Только скрываем элемент, но не удаляем его
+                                if (el instanceof HTMLElement) {
+                                  el.style.display = 'none';
+                                  el.style.visibility = 'hidden';
+                                  el.style.opacity = '0';
+                                  el.style.pointerEvents = 'none';
+                                  el.style.zIndex = '-9999';
+                                  el.style.position = 'absolute';
+                                  el.style.left = '-9999px';
+                                  el.style.top = '-9999px';
+                                  el.style.width = '0';
+                                  el.style.height = '0';
+                                  el.style.overflow = 'hidden';
+                                  console.log("Скрыт вложенный элемент lesson-plan");
+                                }
+                            } catch (e) {
+                                console.error("Ошибка при скрытии вложенного элемента:", e);
+                            }
+                        });
+                    }
+                    
+                    // Восстанавливаем видимость main-content-container
+                    mainContent.style.display = 'block';
+                    mainContent.style.opacity = '1';
+                    mainContent.style.visibility = 'visible';
+                    mainContent.style.zIndex = '10';
+                }
+                
+                // Восстанавливаем видимость основных компонентов
+                const viewClasses = ['home-view', 'courses-view', 'modes-view', 'profile-view'];
+                
+                // Определяем, какой компонент должен быть видимым на основе текущего пути
+                let currentViewClass = '';
+                if (currentPath === '/' || currentPath === '') currentViewClass = 'home-view';
+                else if (currentPath.includes('modes')) currentViewClass = 'modes-view';
+                else if (currentPath.includes('courses')) currentViewClass = 'courses-view';
+                else if (currentPath.includes('profile')) currentViewClass = 'profile-view';
+                
+                // Восстанавливаем видимость текущего компонента
+                if (currentViewClass) {
+                    const viewElement = document.querySelector(`.${currentViewClass}`);
+                    if (viewElement) {
+                        viewElement.style.display = 'block';
+                        viewElement.style.opacity = '1';
+                        viewElement.style.visibility = 'visible';
+                        viewElement.style.zIndex = '30';
+                        console.log(`Восстановлена видимость ${currentViewClass}`);
+                    }
+                }
+                
+                // Принудительно обновляем стили body
+                document.body.style.overflow = '';
+                document.body.style.position = '';
+                document.body.style.height = '';
+                
+                // Принудительно включаем все стили
+                enableAllStyles();
+            }, 0);
+            
+            console.log('Глубокая очистка DOM завершена');
+            return "Очистка DOM завершена";
+        };
+        
+        // Скрываем прелоадер после загрузки
+        window.addEventListener('load', function() {
+            const preloader = document.getElementById('app-preloader');
+            if (preloader) {
+                setTimeout(function() {
+                    preloader.style.opacity = '0';
+                    preloader.style.transition = 'opacity 0.5s ease';
+                    setTimeout(function() {
+                        preloader.style.display = 'none';
+                    }, 500);
+                }, 500);
+            }
+            
+            // Принудительно включаем все стили после загрузки
+            enableAllStyles();
+            
+            // Принудительно делаем приложение видимым
+            const app = document.getElementById('app');
+            if (app) {
+                app.style.display = 'block';
+                app.style.visibility = 'visible';
+                app.style.opacity = '1';
+                app.style.backgroundColor = '#1c0522';
+            }
+            
+            // Инициализация Telegram WebApp
+            if (window.Telegram && window.Telegram.WebApp) {
+                // Сообщаем Telegram, что приложение готово
+                window.Telegram.WebApp.ready();
+                
+                // Расширяем приложение на весь экран
+                setTimeout(function() {
+                    window.Telegram.WebApp.expand();
+                    
+                    // Пытаемся включить полноэкранный режим, если API доступно
+                    if (window.Telegram.WebApp.requestFullscreen) {
+                        try {
+                            window.Telegram.WebApp.requestFullscreen();
+                        } catch (error) {
+                            console.error('Ошибка при запросе полноэкранного режима:', error);
+                        }
+                    }
+                }, 300);
+            }
+        });
+    </script>
+</head>
+<body>
+    <noscript>
+        <strong>We're sorry but this app doesn't work properly without JavaScript enabled. Please enable it to continue.</strong>
+    </noscript>
+    
+    <!-- Прелоадер (удален, теперь используется LoadingScreen.vue) -->
+    
+    <div id="app"></div>
+    
+    <!-- Скрипт для инициализации приложения -->
+    <script type="module" src="/src/main.ts"></script>
+</body>
+</html>

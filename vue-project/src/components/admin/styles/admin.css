@@ -1,0 +1,107 @@
+/* src/components/admin/styles/admin.css */
+
+/* Modal styles */
+.modal-backdrop {
+    @apply fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50;
+}
+
+.modal-container {
+    @apply bg-gray-800 rounded-lg w-full max-w-xl mx-4;
+}
+
+.modal-header {
+    @apply flex justify-between items-center p-6 border-b border-gray-700;
+}
+
+.modal-title {
+    @apply text-xl font-semibold text-white;
+}
+
+.modal-close {
+    @apply text-gray-400 hover:text-white;
+}
+
+.modal-body {
+    @apply p-6 space-y-4;
+}
+
+.modal-label {
+    @apply block text-sm font-medium text-gray-400 mb-1;
+}
+
+.modal-input {
+    @apply w-full bg-gray-700 text-white rounded-lg px-4 py-2 border border-gray-600 focus:border-purple-500 focus:ring-1 focus:ring-purple-500;
+}
+
+.modal-footer {
+    @apply flex justify-end gap-4 pt-4 border-t border-gray-700;
+}
+
+.modal-btn-cancel {
+    @apply px-4 py-2 bg-gray-700 text-white rounded-lg hover:bg-gray-600;
+}
+
+.modal-btn-submit {
+    @apply px-4 py-2 bg-purple-500 text-white rounded-lg hover:bg-purple-600;
+}
+
+/* Component styles */
+.admin-table {
+    @apply w-full text-left;
+}
+
+.admin-table-header {
+    @apply bg-gray-900;
+}
+
+.admin-table-th {
+    @apply p-4 text-gray-400;
+}
+
+.admin-table-row {
+    @apply border-t border-gray-700 hover:bg-gray-700/50;
+}
+
+.admin-table-td {
+    @apply p-4;
+}
+
+.admin-card {
+    @apply bg-gray-800 rounded-lg p-6;
+}
+
+.admin-card-header {
+    @apply flex justify-between items-start;
+}
+
+.admin-card-title {
+    @apply text-lg font-semibold text-white;
+}
+
+.admin-card-subtitle {
+    @apply text-gray-400 text-sm;
+}
+
+.admin-card-content {
+    @apply mt-4 space-y-2;
+}
+
+.admin-badge {
+    @apply px-2 py-1 rounded-full text-xs;
+}
+
+.admin-badge-success {
+    @apply bg-green-500/20 text-green-300;
+}
+
+.admin-badge-warning {
+    @apply bg-orange-500/20 text-orange-300;
+}
+
+.admin-badge-error {
+    @apply bg-red-500/20 text-red-300;
+}
+
+.admin-badge-info {
+    @apply bg-blue-500/20 text-blue-300;
+}

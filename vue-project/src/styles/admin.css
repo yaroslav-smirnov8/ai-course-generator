@@ -1,0 +1,160 @@
+/* src/styles/admin.css */
+
+/* Основные переменные для тёмной темы */
+:root {
+    --admin-bg: #111827;              /* Фон всей админки */
+    --admin-sidebar-bg: #1F2937;      /* Фон сайдбара */
+    --admin-card-bg: #374151;         /* Фон карточек */
+    --admin-hover: #4B5563;           /* Цвет при наведении */
+    --admin-border: #4B5563;          /* Цвет границ */
+    --admin-accent: #8B5CF6;          /* Акцентный цвет */
+    --admin-success: #10B981;         /* Цвет успеха */
+    --admin-warning: #F59E0B;         /* Цвет предупреждения */
+    --admin-error: #EF4444;           /* Цвет ошибки */
+    --admin-text: #F3F4F6;            /* Основной текст */
+    --admin-text-secondary: #9CA3AF;  /* Второстепенный текст */
+}
+
+/* Базовые стили админки */
+.admin-layout {
+    @apply min-h-screen bg-[var(--admin-bg)];
+}
+
+/* Карточки */
+.admin-card {
+    @apply bg-[var(--admin-card-bg)]
+    rounded-xl
+    border border-[var(--admin-border)]
+    shadow-lg
+    overflow-hidden
+    transition-all
+    duration-200
+    hover:shadow-xl;
+}
+
+.admin-card-header {
+    @apply p-6 border-b border-[var(--admin-border)];
+}
+
+.admin-card-title {
+    @apply text-lg font-semibold text-[var(--admin-text)];
+}
+
+.admin-card-description {
+    @apply mt-1 text-sm text-[var(--admin-text-secondary)];
+}
+
+.admin-card-content {
+    @apply p-6;
+}
+
+/* Кнопки */
+.admin-button {
+    @apply px-4 py-2
+    rounded-lg
+    font-medium
+    transition-colors
+    duration-200
+    focus:outline-none
+    focus:ring-2
+    focus:ring-offset-2
+    focus:ring-[var(--admin-accent)];
+}
+
+.admin-button-primary {
+    @apply admin-button
+    bg-[var(--admin-accent)]
+    text-white
+    hover:bg-opacity-90;
+}
+
+.admin-button-secondary {
+    @apply admin-button
+    bg-[var(--admin-card-bg)]
+    text-[var(--admin-text)]
+    border border-[var(--admin-border)]
+    hover:bg-[var(--admin-hover)];
+}
+
+/* Таблицы */
+.admin-table {
+    @apply w-full text-left;
+}
+
+.admin-table-header {
+    @apply bg-[var(--admin-sidebar-bg)];
+}
+
+.admin-table-th {
+    @apply px-6 py-3 text-xs font-medium text-[var(--admin-text-secondary)] uppercase tracking-wider;
+}
+
+.admin-table-td {
+    @apply px-6 py-4 whitespace-nowrap text-sm text-[var(--admin-text)];
+}
+
+.admin-table-row {
+    @apply border-b border-[var(--admin-border)]
+    hover:bg-[var(--admin-hover)]
+    transition-colors
+    duration-200;
+}
+
+/* Формы */
+.admin-input {
+    @apply w-full
+    px-4 py-2
+    bg-[var(--admin-sidebar-bg)]
+    border border-[var(--admin-border)]
+    rounded-lg
+    text-[var(--admin-text)]
+    focus:outline-none
+    focus:ring-2
+    focus:ring-[var(--admin-accent)]
+    focus:border-transparent;
+}
+
+.admin-select {
+    @apply admin-input appearance-none bg-no-repeat;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 24 24' stroke='%239CA3AF'%3E%3Cpath stroke-linecap='round' stroke-linejoin='round' stroke-width='2' d='M19 9l-7 7-7-7'%3E%3C/path%3E%3C/svg%3E");
+    background-position: right 0.5rem center;
+    background-size: 1.5em 1.5em;
+}
+
+/* Бейджи */
+.admin-badge {
+    @apply inline-flex
+    items-center
+    px-2.5 py-0.5
+    rounded-full
+    text-xs
+    font-medium;
+}
+
+.admin-badge-success {
+    @apply bg-[var(--admin-success)] bg-opacity-10 text-[var(--admin-success)];
+}
+
+.admin-badge-warning {
+    @apply bg-[var(--admin-warning)] bg-opacity-10 text-[var(--admin-warning)];
+}
+
+.admin-badge-error {
+    @apply bg-[var(--admin-error)] bg-opacity-10 text-[var(--admin-error)];
+}
+
+/* Графики */
+.admin-chart-container {
+    @apply p-4 rounded-lg bg-[var(--admin-sidebar-bg)];
+}
+
+/* Анимации */
+.admin-fade-enter-active,
+.admin-fade-leave-active {
+    @apply transition-opacity duration-200;
+}
+
+.admin-fade-enter-from,
+.admin-fade-leave-to {
+    @apply opacity-0;
+}
