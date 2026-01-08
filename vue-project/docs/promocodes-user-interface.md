@@ -1,24 +1,24 @@
-# Пользовательский интерфейс для промокодов
+# User Interface for Promocodes
 
-## Обзор
+## Overview
 
-Добавлен полнофункциональный пользовательский интерфейс для работы с промокодами, который позволяет пользователям активировать промокоды и просматривать историю их использования.
+A fully functional user interface for working with promocodes has been added, which allows users to activate promocodes and view their usage history.
 
-## Новые компоненты
+## New Components
 
 ### 1. PromoCodeInput.vue
-**Расположение:** `vue-project/src/components/common/PromoCodeInput.vue`
+**Location:** `vue-project/src/components/common/PromoCodeInput.vue`
 
-**Функциональность:**
-- Модальное окно для ввода промокодов
-- Автоматическое приведение к верхнему регистру
-- Фильтрация недопустимых символов
-- Валидация промокодов
-- Интеграция с Telegram HapticFeedback
-- Toast уведомления об успехе/ошибке
-- Автоматическое закрытие после успешного применения
+**Functionality:**
+- Modal window for promocode input
+- Automatic conversion to uppercase
+- Filtering of invalid characters
+- Promocode validation
+- Integration with Telegram HapticFeedback
+- Toast notifications for success/error
+- Automatic closing after successful application
 
-**Использование:**
+**Usage:**
 ```vue
 <PromoCodeInput
   :show="showModal"
@@ -28,115 +28,115 @@
 ```
 
 ### 2. PromoCodeHistory.vue
-**Расположение:** `vue-project/src/components/common/PromoCodeHistory.vue`
+**Location:** `vue-project/src/components/common/PromoCodeHistory.vue`
 
-**Функциональность:**
-- Отображение истории использованных промокодов
-- Показ полученных баллов, активированных тарифов, скидок
-- Форматирование дат и типов тарифов
-- Обновление истории по кнопке
-- Обработка пустого состояния и ошибок
+**Functionality:**
+- Display of promocode usage history
+- Show received points, activated tariffs, discounts
+- Formatting of dates and tariff types
+- History update via button
+- Handling of empty state and errors
 
-**Использование:**
+**Usage:**
 ```vue
 <PromoCodeHistory />
 ```
 
-## Интеграция в профиль пользователя
+## Integration into User Profile
 
-### Изменения в Profile.vue
+### Changes in Profile.vue
 
-**Добавлена секция промокодов:**
-- Кнопка "Активировать промокод"
-- Кнопка "История" для показа/скрытия истории
-- Интеграция модального окна ввода промокода
-- Автоматическое обновление данных пользователя после применения
+**Promocode section added:**
+- "Activate Promocode" button
+- "History" button to show/hide history
+- Integration of promocode input modal
+- Automatic update of user data after application
 
-**Новые методы:**
-- `handlePromoCodeSuccess()` - обработка успешного применения промокода
-- Автоматическое обновление баллов и тарифов пользователя
+**New methods:**
+- `handlePromoCodeSuccess()` - handling successful promocode application
+- Automatic update of user points and tariffs
 
-## Улучшения в админке
+## Admin Panel Improvements
 
 ### PromocodesManager.vue
 
-**Исправленные проблемы:**
-1. **Редактирование промокодов** - теперь полностью реализовано
-2. **Убраны тестовые данные** - больше нет fallback на фиктивные промокоды
-3. **Упрощена обработка API** - более надежная обработка ответов
+**Fixed issues:**
+1. **Promocode editing** - now fully implemented
+2. **Removed test data** - no more fallback to dummy promocodes
+3. **Simplified API handling** - more reliable response handling
 
-**Новая функциональность:**
-- Полноценное редактирование промокодов
-- Динамические заголовки форм (Создание/Редактирование)
-- Улучшенная обработка ошибок
-- Отмена редактирования с очисткой формы
+**New functionality:**
+- Full promocode editing
+- Dynamic form headers (Create/Edit)
+- Improved error handling
+- Edit cancellation with form clearing
 
-## API интеграция
+## API Integration
 
-### Используемые эндпоинты
+### Endpoints Used
 
-**Пользовательские:**
-- `POST /api/v1/promocodes/apply` - применение промокода
-- `GET /api/v1/promocodes/history` - история использования
+**User endpoints:**
+- `POST /api/v1/promocodes/apply` - apply promocode
+- `GET /api/v1/promocodes/history` - usage history
 
-**Административные:**
-- `GET /api/v1/admin/promocodes/` - список промокодов
-- `POST /api/v1/admin/promocodes` - создание промокода
-- `PUT /api/v1/admin/promocodes/{code}` - обновление промокода
-- `DELETE /api/v1/admin/promocodes/{code}` - деактивация промокода
+**Admin endpoints:**
+- `GET /api/v1/admin/promocodes/` - list of promocodes
+- `POST /api/v1/admin/promocodes` - create promocode
+- `PUT /api/v1/admin/promocodes/{code}` - update promocode
+- `DELETE /api/v1/admin/promocodes/{code}` - deactivate promocode
 
-## Пользовательский опыт
+## User Experience
 
-### Telegram интеграция
-- **HapticFeedback** - тактильная обратная связь при успехе/ошибке
-- **Toast уведомления** - информативные сообщения о результатах
-- **Адаптивный дизайн** - оптимизация для мобильных устройств
+### Telegram Integration
+- **HapticFeedback** - tactile feedback on success/error
+- **Toast notifications** - informative messages about results
+- **Responsive design** - optimization for mobile devices
 
-### Типы промокодов
-1. **Баллы** - добавление баллов на счет пользователя
-2. **Тарифы** - активация тарифных планов
-3. **Скидки** - предоставление скидок на покупки
+### Promocode Types
+1. **Points** - adding points to user account
+2. **Tariffs** - activating tariff plans
+3. **Discounts** - providing discounts on purchases
 
-### Безопасность
-- Валидация промокодов на клиенте и сервере
-- Предотвращение повторного использования
-- Проверка прав доступа
-- Логирование всех операций
+### Security
+- Promocode validation on client and server
+- Prevention of repeated usage
+- Access rights checking
+- Logging of all operations
 
-## Стили и дизайн
+## Styles and Design
 
-### Цветовая схема
-- **Фиолетовый** (#8B5CF6) - основной цвет для кнопок и акцентов
-- **Зеленый** - для успешных операций
-- **Красный** - для ошибок
-- **Серый** - для вторичных элементов
+### Color Scheme
+- **Purple** (#8B5CF6) - main color for buttons and accents
+- **Green** - for successful operations
+- **Red** - for errors
+- **Gray** - for secondary elements
 
-### Анимации
-- Плавные переходы для модальных окон
-- Анимация загрузки (спиннеры)
-- Hover эффекты для интерактивных элементов
+### Animations
+- Smooth transitions for modal windows
+- Loading animation (spinners)
+- Hover effects for interactive elements
 
-## Тестирование
+## Testing
 
-### Рекомендуемые тесты
-1. **Создание промокода** в админке
-2. **Применение промокода** пользователем
-3. **Просмотр истории** промокодов
-4. **Редактирование промокода** в админке
-5. **Обработка ошибок** (неверный промокод, истекший и т.д.)
+### Recommended Tests
+1. **Creating a promocode** in admin panel
+2. **Applying a promocode** by user
+3. **Viewing history** of promocodes
+4. **Editing a promocode** in admin panel
+5. **Error handling** (invalid promocode, expired, etc.)
 
-### Проверка интеграции
-- Обновление баллов пользователя после применения
-- Активация тарифов через промокоды
-- Корректное отображение в истории
-- Работа уведомлений и обратной связи
+### Integration Verification
+- Updating user points after application
+- Activating tariffs through promocodes
+- Correct display in history
+- Working notifications and feedback
 
-## Заключение
+## Conclusion
 
-Реализован полнофункциональный пользовательский интерфейс для промокодов, который:
-- ✅ Решает критическую проблему отсутствия UI для пользователей
-- ✅ Улучшает админку (редактирование, обработка ошибок)
-- ✅ Обеспечивает отличный UX с Telegram интеграцией
-- ✅ Поддерживает все типы промокодов
-- ✅ Включает полную историю использования
-- ✅ Следует принципам безопасности и валидации
+A fully functional user interface for promocodes has been implemented, which:
+- ✅ Solves the critical issue of missing UI for users
+- ✅ Improves admin panel (editing, error handling)
+- ✅ Provides excellent UX with Telegram integration
+- ✅ Supports all promocode types
+- ✅ Includes complete usage history
+- ✅ Follows security and validation principles

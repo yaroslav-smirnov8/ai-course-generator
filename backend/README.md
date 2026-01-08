@@ -1,81 +1,81 @@
-# Улучшенный обработчик JSON для API языковых моделей
+# Enhanced JSON Handler for Language Model APIs
 
-## Обзор проекта
+## Project Overview
 
-Данный проект представляет собой улучшенный обработчик JSON для обработки ответов от API языковых моделей (Gemini, Mistral, Claude и др.) при генерации языковых курсов. Обработчик способен обрабатывать различные форматы данных, исправлять ошибки в JSON и преобразовывать результаты к единой структуре.
+This project is an enhanced JSON handler for processing responses from language model APIs (Gemini, Mistral, Claude, etc.) when generating language courses. The handler is capable of processing various data formats, fixing JSON errors, and converting results to a unified structure.
 
-## Основные возможности
+## Key Features
 
-- Обработка различных форматов JSON из API языковых моделей
-- Извлечение структуры курса из неполных или поврежденных ответов
-- Стандартизация формата данных для использования в приложении
-- Подробное логирование для отладки и мониторинга
-- Восстановление данных из обрезанных ответов API
+- Processing various JSON formats from language model APIs
+- Extracting course structure from incomplete or corrupted responses
+- Standardizing data format for use in the application
+- Detailed logging for debugging and monitoring
+- Recovering data from truncated API responses
 
-## Поддерживаемые форматы данных
+## Supported Data Formats
 
-1. **Стандартный формат курса** - с полями `name`, `description` и массивом `lessons`
-2. **Отдельный урок** - объект с полем `title` и др.
-3. **Массив уроков** - список объектов с полями `title` и др.
-4. **Формат "lesson X"** - объект с ключами вида "lesson 1", "lesson 2" и т.д.
+1. **Standard course format** - with fields `name`, `description` and array `lessons`
+2. **Individual lesson** - object with field `title` and others
+3. **Array of lessons** - list of objects with fields `title` and others
+4. **"lesson X" format** - object with keys like "lesson 1", "lesson 2", etc.
 
-## Структура проекта
+## Project Structure
 
-- `app/services/content/json_extractor.py` - основной модуль обработчика
-- `content_generator/course_generator.py` - модуль генерации курсов, использующий обработчик
-- `demo_json_extractor.py` - демонстрационный скрипт для тестирования обработчика
-- `test_course_generator.py` - тестирование генератора курса с улучшенным обработчиком
-- `README_json_extractor.md` - подробная документация по обработчику JSON
+- `app/services/content/json_extractor.py` - main handler module
+- `content_generator/course_generator.py` - course generation module using the handler
+- `demo_json_extractor.py` - demonstration script for testing the handler
+- `test_course_generator.py` - testing course generator with enhanced handler
+- `README_json_extractor.md` - detailed documentation for JSON handler
 
-## Установка и настройка
+## Installation and Setup
 
-### Создание базы данных
+### Database Creation
 
-База данных PostgreSQL будет автоматически создана с правильной кодировкой UTF8 при первом запуске приложения. Функция `create_database_if_not_exists()` в `app/core/database.py` автоматически:
-- Проверит существование базы данных
-- Создаст базу данных с кодировкой UTF8, если она не существует
-- Настроит правильные параметры локализации
+The PostgreSQL database will be automatically created with the correct UTF8 encoding on the first application run. The `create_database_if_not_exists()` function in `app/core/database.py` will automatically:
+- Check for database existence
+- Create the database with UTF8 encoding if it doesn't exist
+- Configure proper localization parameters
 
-### Настройка переменных окружения
+### Environment Variables Setup
 
-Убедитесь, что в файле `.env` указан правильный пароль базы данных:
+Make sure the correct database password is specified in the `.env` file:
 
 ```
 DATABASE_URL=postgresql://postgres:P8j#Kq2@vL7xZs9$Rt5!@localhost:5432/pldb
 ```
 
-## Использование
+## Usage
 
-### Базовое использование
+### Basic Usage
 
 ```python
 from app.services.content.json_extractor import extract_course_from_api_response
 
-# Получаем ответ от API
-api_response = "...ответ от API..."
+# Get response from API
+api_response = "...API response..."
 
-# Обрабатываем ответ и получаем структуру курса
+# Process response and get course structure
 course_data = extract_course_from_api_response(api_response, debug=True)
 
-# Используем полученные данные
-print(f"Название курса: {course_data.get('name')}")
-print(f"Количество уроков: {len(course_data.get('lessons', []))}")
+# Use the retrieved data
+print(f"Course name: {course_data.get('name')}")
+print(f"Number of lessons: {len(course_data.get('lessons', []))}")
 ```
 
-### Запуск демонстрации
+### Running the Demonstration
 
 ```bash
-# Демонстрация обработки различных форматов JSON
+# Demonstration of processing various JSON formats
 python demo_json_extractor.py
 
-# Тестирование генератора курса с улучшенным обработчиком
+# Testing course generator with enhanced handler
 python test_course_generator.py
 ```
 
-## Интеграция с существующими системами
+## Integration with Existing Systems
 
-Обработчик интегрирован с классом `CourseGenerator`, который используется для генерации языковых курсов. Метод `_process_course_response` был обновлен для использования улучшенного обработчика.
+The handler is integrated with the `CourseGenerator` class, which is used for generating language courses. The `_process_course_response` method has been updated to use the enhanced handler.
 
-## Дополнительная информация
+## Additional Information
 
-Более подробную информацию можно найти в файле `README_json_extractor.md`, который содержит детальное описание работы обработчика, примеры использования и решение возможных проблем. 
+More detailed information can be found in the `README_json_extractor.md` file, which contains a detailed description of the handler's operation, usage examples, and solutions to possible problems. 

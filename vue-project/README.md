@@ -38,46 +38,51 @@ npm run build
 npm run lint
 ```
 
-## Новые функциональные возможности
+## Core Features
 
-### Сервис детализации плана урока
+### Lesson Plan Generation Service
 
-В проект добавлен новый сервис для детализации плана урока, который обеспечивает более точную генерацию контента, соответствующего выбранной теме. Сервис находится в файле `src/services/lessonPlanDetailService.ts`.
+The project includes a comprehensive lesson plan generation service (`src/services/lessonPlanDetailService.ts`) that enables context-aware content creation aligned with selected topics and learning objectives. This service integrates tightly with the backend to provide dynamic, pedagogically sound lesson materials.
 
-Основные функции сервиса:
+#### Primary Service Methods
 
-- **detailLessonPlanScript** - создание скрипта учителя на основе плана урока
-- **detailLessonPlanHomework** - создание домашнего задания для плана урока
-- **detailLessonPlanExercises** - создание дополнительных упражнений для плана урока
-- **detailLessonPlanGame** - создание игровой активности для плана урока
-- **detailLessonPlanPoint** - детализация конкретного пункта плана урока
+- **detailLessonPlanScript** - Generates instructor scripts and narrative guidance for lesson delivery
+- **detailLessonPlanHomework** - Creates structured homework assignments aligned with lesson objectives
+- **detailLessonPlanExercises** - Produces supplementary practice exercises with varied difficulty levels
+- **detailLessonPlanGame** - Develops interactive game-based learning activities for student engagement
+- **detailLessonPlanPoint** - Expands individual lesson elements with detailed pedagogical content
 
-### Система автоматического определения параметров урока
+### Intelligent Parameter Extraction and Validation
 
-В сервис добавлена система для интеллектуального анализа текста плана урока и извлечения из него ключевых параметров:
+The service implements automatic parameter detection and validation through two core functions:
 
-- **extractParamsFromPlan** - функция извлечения параметров урока из текста плана (язык, тема, возраст, методология, формат, тип и т.д.)
-- **mergeAndValidateParams** - функция объединения и проверки параметров из формы, плана и дефолтных значений
+- **extractParamsFromPlan** - Analyzes lesson plan text using natural language processing to identify and extract contextual parameters (language, topic, target age group, pedagogical methodology, lesson format, and proficiency level)
+- **mergeAndValidateParams** - Reconciles parameters from multiple sources (user input, extracted from plan, system defaults) with validation logic to ensure consistency
 
-Поддерживаемые параметры:
-- Язык урока (дефолт: English)
-- Тема урока
-- Возрастная группа (дефолт: teens)
-- Методология
-- Тип занятия: индивидуальный/групповой (дефолт: individual)
-- Формат проведения: онлайн/оффлайн (дефолт: online)
-- Продолжительность (дефолт: 60 минут)
-- Уровень владения языком (дефолт: intermediate)
+#### Supported Lesson Configuration Parameters
 
-Ключевые улучшения:
+| Parameter | Default | Options |
+|-----------|---------|---------|
+| Language | English | Any language |
+| Topic | User-specified | Extracted from plan or manual input |
+| Age Group | Teenagers (13-18) | Elementary, Teenagers, Adults |
+| Teaching Methodology | Communicative | Task-based, Grammar-translation, etc. |
+| Lesson Type | Individual | Individual, Group |
+| Delivery Format | Online | Online, Offline, Hybrid |
+| Duration | 60 minutes | Configurable |
+| Language Level | Intermediate | A1-C2 CEFR levels |
 
-1. Передача темы урока (lesson_focus) из исходного плана в API для генерации тематически согласованного контента
-2. Явная проверка пользовательских лимитов генерации перед отправкой запроса
-3. Детальное логирование всех стадий запроса и ответа для упрощения отладки
-4. Обеспечение сохранения темы при генерации контента через явные указания в параметре action
-5. Более надежная обработка ошибок и нестандартных форматов ответов
-6. **НОВОЕ:** Автоматическая адаптация контента под формат занятия (индивидуальный/групповой)
-7. **НОВОЕ:** Автоматическая адаптация контента под тип проведения (онлайн/оффлайн)
-8. **НОВОЕ:** Интеллектуальное определение параметров из текста плана с поддержкой разных языков
+### Architecture and Processing Pipeline
 
-В компоненте `LessonPlan.vue` добавлен механизм отказоустойчивости - при проблемах с новым сервисом система автоматически переключается на предыдущий метод генерации.
+The system implements a robust multi-stage processing pipeline:
+
+1. **Topic Preservation** - Lesson focus is retained throughout the entire generation workflow via explicit API parameters
+2. **Quota Management** - User generation limits are verified before API requests to prevent quota overages
+3. **Structured Logging** - Comprehensive request/response logging at each processing stage for debugging and analytics
+4. **Content Adaptation** - Generated content automatically adjusts to the specified lesson format (individual/group)
+5. **Delivery Type Optimization** - Materials are customized for online or offline instructional delivery
+6. **Intelligent Fallback** - If the detailed service experiences issues, the system automatically reverts to the baseline generation method
+
+### Exception Handling and Resilience
+
+The `LessonPlan.vue` component implements a built-in failover mechanism. Should the advanced detailing service encounter errors or timeouts, the system gracefully transitions to the previous generation approach, ensuring service continuity and user experience.

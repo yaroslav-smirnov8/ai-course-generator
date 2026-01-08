@@ -1,55 +1,55 @@
-# Модуль для работы с Mistral AI API
+# Module for Working with Mistral AI API
 
-Этот модуль предоставляет простой интерфейс для взаимодействия с Mistral AI API, используя официальную клиентскую библиотеку.
+This module provides a simple interface for interacting with the Mistral AI API using the official client library.
 
-## Установка
+## Installation
 
-Для работы с модулем необходимо установить зависимости:
+To work with the module, you need to install the dependencies:
 
 ```bash
 pip install mistralai python-dotenv httpx
 ```
 
-## Настройка
+## Configuration
 
-1. Создайте файл `.env` в корневой директории проекта и добавьте в него ваш API ключ Mistral:
+1. Create a `.env` file in the project root directory and add your Mistral API key to it:
 
 ```
 MISTRAL_API_KEY=your-api-key-here
-MISTRAL_API_BASE=https://api.mistral.ai  # опционально, если нужно изменить базовый URL
+MISTRAL_API_BASE=https://api.mistral.ai  # optional, if you need to change the base URL
 ```
 
-2. Импортируйте и используйте модуль в своем коде.
+2. Import and use the module in your code.
 
-## Использование
+## Usage
 
-### Самостоятельное использование MistralHandler
+### Standalone Usage of MistralHandler
 
 ```python
 from mistral_api import MistralHandler
 
-# Инициализация
-mistral = MistralHandler(api_key="your-api-key-here")  # или не указывайте, если он задан в .env
+# Initialization
+mistral = MistralHandler(api_key="your-api-key-here")  # or don't specify if it's set in .env
 
-# Проверка доступности
+# Availability check
 if mistral.is_available():
-    # Получение списка доступных моделей
+    # Getting the list of available models
     models = mistral.get_available_models()
-    print(f"Доступно {len(models)} моделей")
-    
-    # Асинхронная генерация текста
+    print(f"Available {len(models)} models")
+
+    # Asynchronous text generation
     async def generate():
         result = await mistral.generate_content(
-            prompt="Напиши стихотворение о программировании",
-            model="open-mistral-nemo",  # можно указать конкретную модель
+            prompt="Write a poem about programming",
+            model="open-mistral-nemo",  # can specify a specific model
             temperature=0.7,
             max_tokens=2048
         )
         print(result)
-    
-    # Синхронная генерация текста
+
+    # Synchronous text generation
     result = mistral.generate_content_sync(
-        prompt="Напиши стихотворение о программировании",
+        prompt="Write a poem about programming",
         model="open-mistral-nemo",
         temperature=0.7,
         max_tokens=2048
@@ -57,68 +57,68 @@ if mistral.is_available():
     print(result)
 ```
 
-### Использование в G4FHandler
+### Usage in G4FHandler
 
-Модуль `mistral_api.py` интегрирован с `G4FHandler` и используется как основной метод для генерации контента:
+The `mistral_api.py` module is integrated with `G4FHandler` and is used as the main method for content generation:
 
 ```python
 from g4f_handler import G4FHandler
 
-# Инициализация
-handler = G4FHandler(api_key="your-api-key-here")  # или не указывайте, если он задан в .env
+# Initialization
+handler = G4FHandler(api_key="your-api-key-here")  # or don't specify if it's set in .env
 
-# Асинхронная генерация через G4FHandler (использует MistralHandler)
+# Asynchronous generation via G4FHandler (uses MistralHandler)
 async def generate():
     result = await handler.generate_content(
-        prompt="Напиши стихотворение о программировании"
+        prompt="Write a poem about programming"
     )
     print(result)
 
-# Синхронная генерация через G4FHandler (использует MistralHandler)
-messages = [{"role": "user", "content": "Напиши стихотворение о программировании"}]
+# Synchronous generation via G4FHandler (uses MistralHandler)
+messages = [{"role": "user", "content": "Write a poem about programming"}]
 result = handler.generate_chat_completion(messages=messages)
 print(result["content"])
 ```
 
-## Тестирование
+## Testing
 
-1. Для тестирования автономной работы модуля Mistral API:
+1. For testing standalone operation of the Mistral API module:
 
 ```bash
 python test_mistral.py
 ```
 
-2. Для тестирования интеграции с G4FHandler:
+2. For testing integration with G4FHandler:
 
 ```bash
 python test_integration.py
 ```
 
-## Обработка ошибок
+## Error Handling
 
-Модуль включает специальные исключения для обработки различных ошибок:
+The module includes special exceptions for handling various errors:
 
-- `MistralAPIException` - базовое исключение для всех ошибок API
-- `MistralConnectionException` - ошибки подключения к API
-- `MistralRateLimitException` - превышение лимита запросов
-- `MistralAuthException` - ошибки авторизации
+- `MistralAPIException` - base exception for all API errors
+- `MistralConnectionException` - API connection errors
+- `MistralRateLimitException` - exceeding request limit
+- `MistralAuthException` - authorization errors
 
-Пример обработки ошибок:
+Example of error handling:
 
 ```python
 from mistral_api import MistralHandler, MistralAPIException, MistralConnectionException
 
 try:
     mistral = MistralHandler(api_key="your-api-key-here")
-    result = mistral.generate_content_sync(prompt="Ваш запрос")
+    result = mistral.generate_content_sync(prompt="Your request")
 except MistralConnectionException as e:
-    print(f"Ошибка подключения: {e}")
+    print(f"Connection error: {e}")
 except MistralAPIException as e:
-    print(f"Ошибка API: {e}")
+    print(f"API error: {e}")
 ```
 
-## Примечания
+## Notes
 
-- При инициализации G4FHandler с корректным API ключом Mistral AI, автоматически будет использоваться Mistral API вместо G4F
-- Если Mistral API недоступен или вернул ошибку, G4FHandler попытается использовать другие провайдеры
-- Для работы с большими контекстами рекомендуется использовать модели с большим значением `max_tokens` 
+- When initializing G4FHandler with a correct Mistral AI API key, Mistral API will automatically be used instead of G4F
+- If Mistral API is unavailable or returns an error, G4FHandler will try to use other providers
+- For working with large contexts, it's recommended to use models with a larger `max_tokens` value
