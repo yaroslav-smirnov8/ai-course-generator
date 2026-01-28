@@ -1,6 +1,34 @@
 # AI Educational Content Generator
 
+**Type:** Hybrid Server-Serverless + Telegram Mini App
+
 A production-grade platform for generating educational content using AI models. Originally developed as a commercial SaaS product, now open-sourced as a portfolio demonstration of modern full-stack architecture.
+
+## Platform & Runtime Requirements
+
+This is a **Telegram Mini App** backed by a hybrid server-serverless architecture. It is platform-dependent and requires multiple external services.
+
+**Core Dependencies:**
+- Telegram Mini App SDK (cryptographic session validation)
+- FastAPI backend (Python 3.9+)
+- PostgreSQL 12+ with async driver
+- Cloudflare Workers for edge computing
+- AI providers: OpenAI, Google Gemini, or Anthropic Claude
+- Vue.js 3 for frontend
+
+**Platform-specific constraints:**
+- Telegram Mini App requires `initData` validation (cryptographic signature verification)
+- Frontend runs inside Telegram client, using Telegram Web App API
+- Backend serves both traditional API endpoints and WebSocket connections
+- Cloudflare Workers layer requires wrangler deployment tooling
+
+**Why full local development without external services is not applicable:**
+- Telegram Mini App development requires either: (a) Telegram test server with Mini App enabled, or (b) external tunnel (ngrok/cloudflared) to expose localhost to Telegram's HTTPS requirements
+- PostgreSQL must be accessible (local Docker container suffices for single developer)
+- AI provider keys are required for generation features (test credentials can be mocked in development)
+- Cloudflare Workers integration requires Wrangler CLI and Cloudflare account access
+
+This is standard for Telegram Mini App development. Telegram explicitly requires HTTPS and external tunneling for Mini App development.
 
 ## 🎯 Project Overview
 
@@ -431,6 +459,41 @@ This platform can generate:
 5. **Modular Design**: Each component can be developed and tested independently
 6. **Prompt Engineering**: Centralized, version-controlled prompt templates
 7. **Error Handling**: Graceful degradation with fallback mechanisms
+
+## What to Review Instead of Running Locally
+
+Best understood through architecture review and code analysis:
+
+### Hybrid Deployment Architecture
+- **Server-Serverless Split** – How critical business logic stays on FastAPI (always-warm) while edge tasks run on Cloudflare Workers
+- **Cold Start Mitigation** – Why persistent FastAPI core is necessary (serverless cold starts break streaming), while Workers handle caching
+- **Cost Optimization** – How this hybrid approach achieves cost efficiency vs. traditional single-provider model
+
+### AI Orchestration Layer
+- **Multi-Provider Routing** (`/backend/app/adapters/`) – Abstract provider interface enabling OpenAI, Gemini, Claude swapping without core changes
+- **Waterfall Strategy** – How requests attempt lower-cost models first, escalate on timeout or failure
+- **Health Monitoring** – Tracking provider failure rates and auto-switching to secondary provider
+- **Cost Tracking** – Per-request cost logging and daily quota management
+
+### Real-Time Streaming Design
+- **Server-Sent Events (SSE)** – How FastAPI StreamingResponse delivers cursor-by-cursor LLM output
+- **Automatic Reconnect** – Client-side logic resuming from last received token if connection drops mid-stream
+- **Buffering Strategy** – How tokens are buffered server-side to enable replay on reconnection
+
+### Telegram Mini App Integration
+- **initData Validation** – HMAC-SHA256 signature verification against Telegram Bot token
+- **Session Management** – JWT token issuance after Telegram auth validation
+- **Client-Side Implementation** – How Vue.js 3 frontend uses Telegram Web App API for haptics, theme detection, etc.
+
+### Database & Async Patterns
+- **Async SQLAlchemy + asyncpg** – Why asyncpg is critical for non-blocking I/O under concurrent generation requests
+- **Connection Pool Tuning** – How pool sizing handles burst traffic from serverless environments
+- **JSONB Course Storage** – Why PostgreSQL JSONB enables flexible schema evolution for lesson structures
+
+### Frontend (Vue.js 3)
+- **State Management with Pinia** – How generation state, user quotas, and course progress are tracked
+- **Real-time Updates** – Integration with SSE endpoint for streaming generation progress
+- **Responsive Design** – TailwindCSS styling optimized for mobile and desktop Telegram clients
 
 ## ⚠️ Known Limitations
 
