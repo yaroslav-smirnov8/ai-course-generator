@@ -112,7 +112,17 @@ npm install
 npm run dev
 ```
 
-Access the application at `http://localhost:5173`
+Access the application:
+
+⚠️ Telegram-specific architecture  
+This project was built as a **Telegram Mini Application** and depends on Telegram WebApp APIs and context data.
+
+For local development and testing:
+- The app must be opened from Telegram
+- A public HTTPS tunnel (ngrok / Cloudflare Tunnel / public IP) is required
+
+This is an intentional architectural decision, not a deployment limitation.
+
 
 ## ⚙️ Configuration
 
