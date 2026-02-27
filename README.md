@@ -523,9 +523,7 @@ This is a portfolio project demonstrating production-ready patterns. Feel free t
 
 ## 📄 License
 
-Creative Commons Attribution-NonCommercial 4.0 International (CC BY-NC 4.0)
-
-This project is licensed for non-commercial use only. See [LICENSE](LICENSE) for details.
+MIT. See [LICENSE](LICENSE) for details.
 
 ## 👤 Author
 
