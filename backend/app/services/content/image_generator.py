@@ -54,7 +54,7 @@ class ImageGenerationService:
             except Exception as e:
                 logger.warning(f"⚠️ Cloudflare SDXL provider initialization error: {e}")
         
-        # 2. Together AI Flux Schnell (приоритет #2 - был #1, бесплатный и быстрый)
+        # 2. Together AI Flux Schnell (приоритет #2 - бесплатный и быстрый)
         try:
             from ...utils.together_images_api import TogetherImagesHandler, TOGETHER_IMAGES_AVAILABLE
             
@@ -77,37 +77,6 @@ class ImageGenerationService:
                 
         except ImportError as e:
             logger.warning(f"⚠️ Flux Schnell provider unavailable (import error): {e}")
-        
-        # 3. G4F SDXL (приоритет #3 - был #2, fallback)
-        try:
-            from g4f import AsyncClient
-            from g4f.Provider import RetryProvider, Pizzagpt, Pi, FreeChatgpt, You, GeminiPro, HuggingChat, DeepInfra, DeepInfraChat, ChatGpt, AiChatOnline, NexraFluxPro, AmigoChat, Airforce
-            
-            g4f_client = AsyncClient(
-                provider=RetryProvider([
-                    Pizzagpt, Pi, FreeChatgpt, You,
-                    GeminiPro, HuggingChat, DeepInfra,
-                    DeepInfraChat, ChatGpt, AiChatOnline,
-                    NexraFluxPro, AmigoChat, Airforce
-                ], shuffle=True)
-            )
-            
-            # Рассчитываем приоритет в зависимости от того, какие провайдеры активированы
-            cloudflare_available = any(p['name'] == 'cloudflare_sdxl' for p in self.providers)
-            together_available = any(p['name'] == 'flux_schnell' for p in self.providers)
-            priority = 1 + (1 if cloudflare_available else 0) + (1 if together_available else 0)
-            
-            self.providers.append({
-                'name': 'g4f_sdxl',
-                'handler': g4f_client,
-                'priority': priority,
-                'description': 'G4F Stable Diffusion XL',
-                'supports_local_save': False
-            })
-            logger.info("✅ G4F SDXL provider initialized")
-            
-        except ImportError as e:
-            logger.warning(f"⚠️ G4F SDXL provider unavailable (import error): {e}")
         
         # Сортируем провайдеры по приоритету
         self.providers.sort(key=lambda x: x['priority'])
@@ -197,36 +166,6 @@ class ImageGenerationService:
                     })
                     
                     return result
-                    
-                elif provider_name == 'g4f_sdxl':
-                    # G4F SDXL
-                    response = await handler.images.generate(
-                        model="sdxl",
-                        prompt=prompt,
-                        response_format="url"
-                    )
-                    
-                    if not response or not response.data:
-                        raise Exception("Empty response from G4F SDXL")
-                    
-                    image_url = response.data[0].url
-                    
-                    logger.info(f"✅ Successfully generated image with {provider_info['description']}")
-                    
-                    result = {
-                        'url': image_url,
-                        'model': 'sdxl',
-                        'provider': provider_name,
-                        'provider_used': provider_name,
-                        'provider_description': provider_info['description'],
-                        'width': width,
-                        'height': height,
-                        'saved_locally': False,
-                        'generation_time': datetime.now().isoformat(),
-                        'user_id': user_id
-                    }
-                    
-                    return result
                 
             except Exception as e:
                 last_error = e
@@ -284,11 +223,6 @@ class ImageGenerationService:
                     # Проверяем доступность Flux
                     is_available = provider_info['handler'].is_available()
                     status = 'healthy' if is_available else 'no_api_keys'
-                    
-                elif provider_name == 'g4f_sdxl':
-                    # G4F всегда считается доступным
-                    is_available = True
-                    status = 'healthy'
                     
                 else:
                     is_available = False
