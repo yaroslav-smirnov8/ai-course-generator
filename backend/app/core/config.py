@@ -164,6 +164,11 @@ class Settings(BaseSettings):
         }
     }
 
+    # Cloudflare AI SDXL Configuration
+    CLOUDFLARE_ACCOUNT_ID: Optional[str] = Field(default=None, description="Cloudflare Account ID for Workers AI")
+    CLOUDFLARE_API_TOKEN: Optional[str] = Field(default=None, description="Cloudflare API Token for Workers AI")
+    CLOUDFLARE_AI_ENABLED: bool = Field(default=True, description="Enable Cloudflare AI SDXL provider")
+
     model_config = SettingsConfigDict(
         case_sensitive=True,
         env_file='.env',

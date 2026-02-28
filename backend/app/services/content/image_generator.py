@@ -1,6 +1,6 @@
 """
 Unified Image Generation Service
-Объединенный сервис генерации изображений с приоритетом Flux Schnell
+Объединенный сервис генерации изображений с приоритетной системой провайдеров
 """
 
 import os
@@ -27,17 +27,45 @@ class ImageGenerationService:
     def _initialize_providers(self):
         """Инициализирует провайдеры в порядке приоритета"""
         
-        # 1. Together AI Flux Schnell (приоритет #1 - бесплатный и быстрый)
+        # Проверяем включен ли Cloudflare AI
+        from ...core.config import get_settings
+        settings = get_settings()
+        cloudflare_enabled = settings.CLOUDFLARE_AI_ENABLED
+        
+        # 1. Cloudflare AI SDXL (приоритет #1 - если включен)
+        if cloudflare_enabled:
+            try:
+                from ...utils.cloudflare_sdxl_handler import CloudflareSDXLHandler, CLOUDFLARE_AI_AVAILABLE, cloudflare_sdxl_handler
+                
+                if CLOUDFLARE_AI_AVAILABLE and cloudflare_sdxl_handler and cloudflare_sdxl_handler.is_available():
+                    self.providers.append({
+                        'name': 'cloudflare_sdxl',
+                        'handler': cloudflare_sdxl_handler,
+                        'priority': 1,
+                        'description': 'Cloudflare AI SDXL',
+                        'supports_local_save': True
+                    })
+                    logger.info("✅ Cloudflare SDXL provider initialized")
+                else:
+                    logger.warning("⚠️ Cloudflare SDXL provider unavailable (no credentials)")
+                    
+            except ImportError as e:
+                logger.warning(f"⚠️ Cloudflare SDXL provider unavailable (import error): {e}")
+            except Exception as e:
+                logger.warning(f"⚠️ Cloudflare SDXL provider initialization error: {e}")
+        
+        # 2. Together AI Flux Schnell (приоритет #2 - был #1, бесплатный и быстрый)
         try:
             from ...utils.together_images_api import TogetherImagesHandler, TOGETHER_IMAGES_AVAILABLE
             
             if TOGETHER_IMAGES_AVAILABLE:
                 flux_handler = TogetherImagesHandler()
                 if flux_handler.is_available():
+                    priority = 1 if not cloudflare_enabled else 2
                     self.providers.append({
                         'name': 'flux_schnell',
                         'handler': flux_handler,
-                        'priority': 1,
+                        'priority': priority,
                         'description': 'Together AI Flux Schnell (Free)',
                         'supports_local_save': True
                     })
@@ -50,7 +78,7 @@ class ImageGenerationService:
         except ImportError as e:
             logger.warning(f"⚠️ Flux Schnell provider unavailable (import error): {e}")
         
-        # 2. G4F SDXL (приоритет #2 - fallback)
+        # 3. G4F SDXL (приоритет #3 - был #2, fallback)
         try:
             from g4f import AsyncClient
             from g4f.Provider import RetryProvider, Pizzagpt, Pi, FreeChatgpt, You, GeminiPro, HuggingChat, DeepInfra, DeepInfraChat, ChatGpt, AiChatOnline, NexraFluxPro, AmigoChat, Airforce
@@ -58,16 +86,21 @@ class ImageGenerationService:
             g4f_client = AsyncClient(
                 provider=RetryProvider([
                     Pizzagpt, Pi, FreeChatgpt, You,
-                    GeminiPro, HuggingChat, DeepInfra, 
+                    GeminiPro, HuggingChat, DeepInfra,
                     DeepInfraChat, ChatGpt, AiChatOnline,
                     NexraFluxPro, AmigoChat, Airforce
                 ], shuffle=True)
             )
             
+            # Рассчитываем приоритет в зависимости от того, какие провайдеры активированы
+            cloudflare_available = any(p['name'] == 'cloudflare_sdxl' for p in self.providers)
+            together_available = any(p['name'] == 'flux_schnell' for p in self.providers)
+            priority = 1 + (1 if cloudflare_available else 0) + (1 if together_available else 0)
+            
             self.providers.append({
                 'name': 'g4f_sdxl',
                 'handler': g4f_client,
-                'priority': 2,
+                'priority': priority,
                 'description': 'G4F Stable Diffusion XL',
                 'supports_local_save': False
             })
@@ -122,7 +155,28 @@ class ImageGenerationService:
             try:
                 logger.info(f"🔄 Trying provider: {provider_info['description']}")
                 
-                if provider_name == 'flux_schnell':
+                if provider_name == 'cloudflare_sdxl':
+                    # Cloudflare AI SDXL
+                    result = await handler.generate_image(
+                        prompt=prompt,
+                        width=width,
+                        height=height,
+                        save_locally=save_locally and provider_info['supports_local_save']
+                    )
+                    
+                    logger.info(f"✅ Successfully generated image with {provider_info['description']}")
+                    
+                    # Добавляем метаданные
+                    result.update({
+                        'provider_used': provider_name,
+                        'provider_description': provider_info['description'],
+                        'generation_time': datetime.now().isoformat(),
+                        'user_id': user_id
+                    })
+                    
+                    return result
+                    
+                elif provider_name == 'flux_schnell':
                     # Together AI Flux Schnell через Worker
                     result = await handler.generate_image(
                         prompt=prompt,
@@ -221,7 +275,12 @@ class ImageGenerationService:
             provider_name = provider_info['name']
             
             try:
-                if provider_name == 'flux_schnell':
+                if provider_name == 'cloudflare_sdxl':
+                    # Проверяем доступность Cloudflare SDXL
+                    is_available = provider_info['handler'].is_available()
+                    status = 'healthy' if is_available else 'no_credentials'
+                    
+                elif provider_name == 'flux_schnell':
                     # Проверяем доступность Flux
                     is_available = provider_info['handler'].is_available()
                     status = 'healthy' if is_available else 'no_api_keys'
